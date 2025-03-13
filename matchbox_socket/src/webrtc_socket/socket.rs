@@ -241,6 +241,183 @@ impl WebRtcSocketBuilder {
             Box::pin(socket_fut),
         )
     }
+
+    /// Build wth alternative API focused on callbacks
+    pub fn build_with_callbacks<T: callbacks::Callbacks>(self, callbacks: T) {}
+}
+
+mod callbacks {
+    use std::{
+        collections::VecDeque, future::{self, Future}, pin::Pin, sync::Arc, task::{Poll, Waker}
+    };
+
+    use arc_swap::ArcSwapOption;
+    use futures::{Sink, Stream};
+    use matchbox_protocol::PeerId;
+    use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
+
+    use crate::{
+        webrtc_socket::{PacketSendError, PeerDataSender},
+        Packet,
+    };
+    pub trait Callbacks {
+        fn connected(&mut self, peer: ConnectedPeer);
+    }
+
+    struct ConnectedPeer {
+        remote: PeerId,
+        channels: Vec<PeerChannel>,
+    }
+
+    /// Connection to a specific peer via a specific channel.
+    ///
+    /// Corresponds to an [RTCDataChannel](https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel).
+    struct PeerChannel {
+        incoming: PeerSource,
+        outgoing: PeerSink,
+    }
+
+    type DataChannelRef = Arc<Mutex<Box<dyn Sender + Send>>>;
+
+    trait Sender: PeerDataSender {
+        /// https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/bufferedamountlow_event
+        fn on_buffered_amount_low(&mut self) -> &mut ArcSwapOption<Mutex<OnBufferedAmountLowFn>>;
+        fn buffered_amount(&self) -> usize;
+        fn on_packet(&mut self) -> &mut ArcSwapOption<Mutex<OnPacketFn>>;
+    }
+
+    pub type OnBufferedAmountLowFn =
+        Box<dyn (FnMut() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>) + Send + Sync>;
+
+    pub type OnPacketFn =
+        Box<dyn (FnMut(Packet) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>) + Send + Sync>;
+
+    struct PeerSink {
+        inner: DataChannelRef,
+    }
+
+    struct PeerSource {
+        inner: DataChannelRef,
+    }
+
+    impl PeerSource {
+        pub fn on_packet(
+            &mut self,
+        ) -> MappedMutexGuard<ArcSwapOption<Mutex<OnPacketFn>>> {
+            MutexGuard::map(self.inner.lock(), |d| d.on_packet())
+        }
+
+        pub fn into_sink(mut self) -> PeerAsSource {
+            let wakers: Arc<Mutex<Vec<Waker>>> = Arc::new(Mutex::new(vec![]));
+            let buffer: Arc<Mutex<VecDeque<Packet>>> = Arc::new(Mutex::new(VecDeque::default()));
+            let buffer2= buffer.clone();
+            let wakers2 = wakers.clone();
+            self.on_packet().store( Some(Arc::new(Mutex::new(Box::new(move |packet| -> Pin<Box<(dyn futures::Future<Output = ()> + std::marker::Send + 'static)>> {
+                buffer2.lock().push_back(packet);
+                for w in wakers2.lock().drain(..) {
+                    w.wake();
+                }
+                return Box::pin(future::ready(()));
+            })))));
+
+            
+            PeerAsSource { rx: self, wakers, buffer }
+        }
+    }
+
+    impl PeerSink {
+        pub fn on_buffered_amount_low(
+            &mut self,
+        ) -> MappedMutexGuard<ArcSwapOption<Mutex<OnBufferedAmountLowFn>>> {
+            MutexGuard::map(self.inner.lock(), |d| d.on_buffered_amount_low())
+        }
+
+        pub fn buffered_amount(&self) -> usize {
+            self.inner.lock().buffered_amount()
+        }
+
+        pub fn send(&mut self, packet: Packet) -> Result<(), PacketSendError> {
+            self.inner.lock().send(packet)
+        }
+
+        pub fn into_sink(mut self) -> PeerAsSink {
+            let wakers: Arc<Mutex<Vec<Waker>>> = Arc::new(Mutex::new(vec![]));
+            let wakers2 = wakers.clone();
+            self.on_buffered_amount_low().store( Some(Arc::new(Mutex::new(Box::new(move || -> Pin<Box<(dyn futures::Future<Output = ()> + std::marker::Send + 'static)>> {
+                for w in wakers2.lock().drain(..) {
+                    w.wake();
+                }
+                return Box::pin(future::ready(()));
+            })))));
+            PeerAsSink { tx: self, wakers }
+        }
+    }
+
+    struct PeerAsSink {
+        tx: PeerSink,
+        wakers: Arc<Mutex<Vec<Waker>>>,
+    }
+
+    
+
+    impl Sink<Packet> for PeerAsSink {
+        type Error = PacketSendError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if self.tx.buffered_amount() == 0 {
+                Poll::Ready(Ok(()))
+            } else {
+                let wakers = Pin::new(&mut self.get_mut().wakers);
+                wakers.lock().push(cx.waker().to_owned());
+                Poll::Pending
+            }
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Packet) -> Result<(), Self::Error> {
+            let mut tx = Pin::new(&mut self.get_mut().tx);
+            tx.send(item)
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            self.poll_ready(cx)
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    struct PeerAsSource {
+        rx: PeerSource,
+        wakers: Arc<Mutex<Vec<Waker>>>,
+        buffer: Arc<Mutex<VecDeque<Packet>>>,
+    }
+
+    impl Stream for PeerAsSource {
+        type Item = Packet;
+        
+        fn poll_next(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
+            match self.buffer.lock().pop_front() {
+                Some(packet) => {
+                    Poll::Ready(Some(packet))
+                }
+                None => {
+                    self.wakers.lock().push(cx.waker().to_owned());
+                    // TODO: support Poll::Ready(None) in disconnected case.
+                    Poll::Pending
+                },
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
