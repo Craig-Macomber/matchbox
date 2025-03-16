@@ -1,20 +1,34 @@
-use super::error::{ChannelError, SignalingError};
+use super::{
+    error::{ChannelError, SignalingError},
+    ChannelBuilder, DataChannelEventReceiver,
+};
 use crate::{
     webrtc_socket::{
-        message_loop, signaling_loop, MessageLoopFuture, Packet, PeerEvent, PeerRequest,
-        UseMessenger, UseSignaller,
+        message_loop, signal_peer::SignalPeer, signaling_loop, MessageLoopFuture, Packet,
+        PeerEvent, PeerRequest, UseMessenger, UseSignaller,
     },
     Error,
 };
 use bytes::Bytes;
 use futures::{
-    future::Fuse, select, AsyncRead, AsyncWrite, Future, FutureExt, Sink, SinkExt, Stream,
-    StreamExt, TryStreamExt,
+    future::Either, select, stream::FuturesUnordered, AsyncRead, AsyncWrite, Future, FutureExt,
+    Sink, SinkExt, Stream, StreamExt, TryStreamExt,
 };
 use futures_channel::mpsc::{SendError, TrySendError, UnboundedReceiver, UnboundedSender};
-use log::{debug, error};
+use futures_timer::Delay;
+use log::{debug, error, warn};
 use matchbox_protocol::PeerId;
-use std::{collections::HashMap, future::ready, pin::Pin, task::Poll, time::Duration};
+use std::{
+    collections::HashMap,
+    future::ready,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize},
+        Arc,
+    },
+    task::Poll,
+    time::Duration,
+};
 use tokio_util::{
     compat::TokioAsyncWriteCompatExt,
     io::{CopyToBytes, SinkWriter},
@@ -179,16 +193,20 @@ impl WebRtcSocketBuilder {
         self
     }
 
+    fn validate(&self) {
+        assert!(
+            !self.config.channels.is_empty(),
+            "Must have added at least one channel"
+        );
+    }
+
     /// Creates a [`WebRtcSocket`] and the corresponding [`MessageLoopFuture`] according to the
     /// configuration supplied.
     ///
     /// The returned [`MessageLoopFuture`] should be awaited in order for messages to be sent and
     /// received.
     pub fn build(self) -> (WebRtcSocket, MessageLoopFuture) {
-        assert!(
-            !self.config.channels.is_empty(),
-            "Must have added at least one channel"
-        );
+        self.validate();
 
         let (peer_state_tx, peer_state_rx) = futures_channel::mpsc::unbounded();
 
@@ -215,7 +233,6 @@ impl WebRtcSocketBuilder {
             id_tx,
             self.config,
             peer_messages_out_rx,
-            peer_state_tx,
             messages_from_peers_tx,
         )
         // Transform the source into a user-error.
@@ -243,12 +260,187 @@ impl WebRtcSocketBuilder {
     }
 
     /// Build wth alternative API focused on callbacks
-    pub fn build_with_callbacks<T: callbacks::Callbacks>(self, callbacks: T) {}
+    pub fn run_with_callbacks<T: callbacks::Callbacks>(self, callbacks: T) -> impl Future + Send {
+        self.validate();
+        let config = self.config;
+
+        debug!("Starting WebRtcSocket");
+
+        let (requests_sender, requests_receiver) =
+            futures_channel::mpsc::unbounded::<PeerRequest>();
+        let (events_sender, events_receiver) = futures_channel::mpsc::unbounded::<PeerEvent>();
+
+        let signaling_loop_fut = signaling_loop::<UseSignaller>(
+            config.attempts,
+            config.room_url,
+            requests_receiver,
+            events_sender,
+        );
+
+        // let message_loop_fut = message_loop::<UseMessenger>(
+        //     id_tx,
+        //     &config.ice_server,
+        //     &config.channels,
+        //     channels,
+        //     config.keep_alive_interval,
+        // );
+
+        let mut handshakes = FuturesUnordered::new();
+        let mut peer_loops = FuturesUnordered::new();
+        let mut handshake_signals = HashMap::new();
+        let mut data_channels = HashMap::new();
+
+        let mut id = None;
+
+        let mut timeout = if let Some(interval) = config.keep_alive_interval {
+            Either::Left(Delay::new(interval))
+        } else {
+            Either::Right(std::future::pending())
+        }
+        .fuse();
+        async {
+            loop {
+                select! {
+                    _  = &mut timeout => {
+                        if requests_sender.unbounded_send(PeerRequest::KeepAlive).is_err() {
+                            // socket dropped
+                            break Ok(());
+                        }
+                        if let Some(interval) = config.keep_alive_interval {
+                            timeout = Either::Left(Delay::new(interval)).fuse();
+                        } else {
+                            error!("no keep alive timeout, please file a bug");
+                        }
+                    }
+
+                    message = events_receiver.next().fuse() => {
+                        if let Some(event) = message {
+                            debug!("{event:?}");
+                            match event {
+                                PeerEvent::IdAssigned(peer_uuid) => {
+                                    callbacks.connected(peer_uuid);
+                                },
+                                PeerEvent::NewPeer(peer_uuid) => {
+                                    let (signal_tx, signal_rx) = futures_channel::mpsc::unbounded();
+                                    handshake_signals.insert(peer_uuid, signal_tx);
+                                    let signal_peer = SignalPeer::new(peer_uuid, requests_sender.clone());
+                                    handshakes.push(M::offer_handshake(signal_peer, signal_rx, messages_from_peers_tx.clone(), config.ice_server, channel_configs))
+                                },
+                                PeerEvent::PeerLeft(peer_uuid) => {
+                                    if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected)).is_err() {
+                                        // socket dropped, exit cleanly
+                                        break Ok(());
+                                    }
+                                },
+                                PeerEvent::Signal { sender, data } => {
+                                    let signal_tx = handshake_signals.entry(sender).or_insert_with(|| {
+                                        let (from_peer_tx, peer_signal_rx) = futures_channel::mpsc::unbounded();
+                                        let signal_peer = SignalPeer::new(sender, requests_sender.clone());
+                                        handshakes.push(M::accept_handshake(signal_peer, peer_signal_rx, messages_from_peers_tx.clone(), config.ice_server, channel_configs));
+                                        from_peer_tx
+                                    });
+
+                                    if signal_tx.unbounded_send(data).is_err() {
+                                        warn!("ignoring signal from peer {sender} because the handshake has already finished");
+                                    }
+                                },
+                            }
+                        }
+                    }
+
+                    handshake_result = handshakes.select_next_some() => {
+                        data_channels.insert(handshake_result.peer_id, handshake_result.data_channels);
+                        if peer_state_tx.unbounded_send((handshake_result.peer_id, PeerState::Connected)).is_err() {
+                            // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore
+                            break Ok(());
+                        }
+                        peer_loops.push(M::peer_loop(handshake_result.peer_id, handshake_result.metadata));
+                    }
+
+                    peer_uuid = peer_loops.select_next_some() => {
+                        debug!("peer {peer_uuid} finished");
+                        if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected)).is_err() {
+                            // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore
+                            break Ok(());
+                        }
+                    }
+
+                    message = next_peer_message_out => {
+                        match message {
+                            Some((channel_index, Some((peer, packet)))) => {
+                                let data_channel = data_channels
+                                    .get_mut(&peer)
+                                    .expect("couldn't find data channel for peer")
+                                    .get_mut(channel_index).unwrap_or_else(|| panic!("couldn't find data channel with index {channel_index}"));
+                                if let Err(e) = data_channel.send(packet) {
+                                    // Peer we're sending to closed their end of the connection.
+                                    // We anticipate the PeerLeft event soon, but we sent a message before it came.
+                                    // Do nothing. Only log it.
+                                    warn!("failed to send to peer {peer} (socket closed): {e:?}");
+                                };
+                            }
+                            Some((_, None)) | None => {
+                                // Receiver end of outgoing message channel closed,
+                                // which most likely means the socket was dropped.
+                                // There could probably be cleaner ways to handle this,
+                                // but for now, just exit cleanly.
+                                warn!("Outgoing message queue closed, message not sent");
+                                break Ok(());
+                            }
+                        }
+                    }
+
+                    complete => break Ok(())
+                }
+            }
+
+            let mut message_loop_done = Box::pin(message_loop_fut.fuse());
+            let mut signaling_loop_done = Box::pin(signaling_loop_fut.fuse());
+
+            loop {
+                select! {
+                    msgloop = message_loop_done => {
+                        match msgloop {
+                            Ok(()) | Err(SignalingError::StreamExhausted) => {
+                                debug!("Message loop completed");
+                                break Ok(())
+                            },
+                            Err(e) => {
+                                // TODO: Reconnect X attempts if configured to reconnect.
+                                error!("The message loop finished with an error: {e:?}");
+                                break Err(e);
+                            },
+                        }
+                    }
+
+                    sigloop = signaling_loop_done => {
+                        match sigloop {
+                            Ok(()) => debug!("Signaling loop completed"),
+                            Err(SignalingError::StreamExhausted) => {
+                                debug!("Signaling loop completed");
+                                break Ok(());
+                            },
+                            Err(e) => {
+                                // TODO: Reconnect X attempts if configured to reconnect.
+                                error!("The signaling loop finished with an error: {e:?}");
+                                break Err(e);
+                            },
+                        }
+                    }
+
+                    complete => break Ok(())
+                }
+            }
+        }
+    }
 }
 
 mod callbacks {
     use std::{
-        collections::VecDeque, future::{self, Future}, pin::Pin, sync::Arc, task::{Poll, Waker}
+        collections::VecDeque,
+        pin::Pin,
+        sync::Arc,
+        task::{Poll, Waker},
     };
 
     use arc_swap::ArcSwapOption;
@@ -257,11 +449,14 @@ mod callbacks {
     use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 
     use crate::{
-        webrtc_socket::{PacketSendError, PeerDataSender},
+        webrtc_socket::{
+            platform_abstraction::MatchboxDataChannel, PacketSendError, PeerDataSender,
+        },
         Packet,
     };
     pub trait Callbacks {
-        fn connected(&mut self, peer: ConnectedPeer);
+        fn connected(&mut self, id: PeerId);
+        fn peer_connected(&mut self, peer: ConnectedPeer);
     }
 
     struct ConnectedPeer {
@@ -277,20 +472,11 @@ mod callbacks {
         outgoing: PeerSink,
     }
 
-    type DataChannelRef = Arc<Mutex<Box<dyn Sender + Send>>>;
+    type DataChannelRef = Arc<Mutex<Box<dyn MatchboxDataChannel + Send>>>;
 
-    trait Sender: PeerDataSender {
-        /// https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/bufferedamountlow_event
-        fn on_buffered_amount_low(&mut self) -> &mut ArcSwapOption<Mutex<OnBufferedAmountLowFn>>;
-        fn buffered_amount(&self) -> usize;
-        fn on_packet(&mut self) -> &mut ArcSwapOption<Mutex<OnPacketFn>>;
-    }
+    pub type OnBufferedAmountLowFn = Box<dyn (FnMut()) + Send + Sync>;
 
-    pub type OnBufferedAmountLowFn =
-        Box<dyn (FnMut() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>) + Send + Sync>;
-
-    pub type OnPacketFn =
-        Box<dyn (FnMut(Packet) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>) + Send + Sync>;
+    pub type OnPacketFn = Box<dyn (FnMut(Packet)) + Send + Sync>;
 
     struct PeerSink {
         inner: DataChannelRef,
@@ -301,27 +487,28 @@ mod callbacks {
     }
 
     impl PeerSource {
-        pub fn on_packet(
-            &mut self,
-        ) -> MappedMutexGuard<ArcSwapOption<Mutex<OnPacketFn>>> {
+        pub fn on_packet(&mut self) -> MappedMutexGuard<ArcSwapOption<Mutex<OnPacketFn>>> {
             MutexGuard::map(self.inner.lock(), |d| d.on_packet())
         }
 
         pub fn into_sink(mut self) -> PeerAsSource {
             let wakers: Arc<Mutex<Vec<Waker>>> = Arc::new(Mutex::new(vec![]));
             let buffer: Arc<Mutex<VecDeque<Packet>>> = Arc::new(Mutex::new(VecDeque::default()));
-            let buffer2= buffer.clone();
+            let buffer2 = buffer.clone();
             let wakers2 = wakers.clone();
-            self.on_packet().store( Some(Arc::new(Mutex::new(Box::new(move |packet| -> Pin<Box<(dyn futures::Future<Output = ()> + std::marker::Send + 'static)>> {
-                buffer2.lock().push_back(packet);
-                for w in wakers2.lock().drain(..) {
-                    w.wake();
-                }
-                return Box::pin(future::ready(()));
-            })))));
+            self.on_packet()
+                .store(Some(Arc::new(Mutex::new(Box::new(move |packet| {
+                    buffer2.lock().push_back(packet);
+                    for w in wakers2.lock().drain(..) {
+                        w.wake();
+                    }
+                })))));
 
-            
-            PeerAsSource { rx: self, wakers, buffer }
+            PeerAsSource {
+                rx: self,
+                wakers,
+                buffer,
+            }
         }
     }
 
@@ -343,12 +530,12 @@ mod callbacks {
         pub fn into_sink(mut self) -> PeerAsSink {
             let wakers: Arc<Mutex<Vec<Waker>>> = Arc::new(Mutex::new(vec![]));
             let wakers2 = wakers.clone();
-            self.on_buffered_amount_low().store( Some(Arc::new(Mutex::new(Box::new(move || -> Pin<Box<(dyn futures::Future<Output = ()> + std::marker::Send + 'static)>> {
-                for w in wakers2.lock().drain(..) {
-                    w.wake();
-                }
-                return Box::pin(future::ready(()));
-            })))));
+            self.on_buffered_amount_low()
+                .store(Some(Arc::new(Mutex::new(Box::new(move || {
+                    for w in wakers2.lock().drain(..) {
+                        w.wake();
+                    }
+                })))));
             PeerAsSink { tx: self, wakers }
         }
     }
@@ -357,8 +544,6 @@ mod callbacks {
         tx: PeerSink,
         wakers: Arc<Mutex<Vec<Waker>>>,
     }
-
-    
 
     impl Sink<Packet> for PeerAsSink {
         type Error = PacketSendError;
@@ -404,17 +589,18 @@ mod callbacks {
 
     impl Stream for PeerAsSource {
         type Item = Packet;
-        
-        fn poll_next(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
             match self.buffer.lock().pop_front() {
-                Some(packet) => {
-                    Poll::Ready(Some(packet))
-                }
+                Some(packet) => Poll::Ready(Some(packet)),
                 None => {
                     self.wakers.lock().push(cx.waker().to_owned());
                     // TODO: support Poll::Ready(None) in disconnected case.
                     Poll::Pending
-                },
+                }
             }
         }
     }
@@ -911,42 +1097,123 @@ impl WebRtcSocket {
     }
 }
 
-pub(crate) fn create_data_channels_ready_fut(
-    channel_configs: &[ChannelConfig],
-) -> (
-    Vec<futures_channel::mpsc::Sender<()>>,
-    Pin<Box<Fuse<impl Future<Output = ()>>>>,
-) {
-    let (senders, receivers) = (0..channel_configs.len())
-        .map(|_| futures_channel::mpsc::channel(1))
-        .unzip();
-
-    (senders, Box::pin(wait_for_ready(receivers).fuse()))
-}
-
-async fn wait_for_ready(channel_ready_rx: Vec<futures_channel::mpsc::Receiver<()>>) {
-    for mut receiver in channel_ready_rx {
-        if receiver.next().await.is_none() {
-            panic!("Sender closed before channel was ready");
-        }
-    }
-}
-
 /// All the channels needed for the messaging loop.
 pub struct MessageLoopChannels {
     pub requests_sender: futures_channel::mpsc::UnboundedSender<PeerRequest>,
     pub events_receiver: futures_channel::mpsc::UnboundedReceiver<PeerEvent>,
-    pub peer_messages_out_rx: Vec<futures_channel::mpsc::UnboundedReceiver<(PeerId, Packet)>>,
-    pub peer_state_tx: futures_channel::mpsc::UnboundedSender<(PeerId, PeerState)>,
-    pub messages_from_peers_tx: Vec<futures_channel::mpsc::UnboundedSender<(PeerId, Packet)>>,
+}
+
+/// Merges messages from all peers for a given channel
+struct MessageLoopChannel {
+    pub config: ChannelConfig,
+    /// Sends packet to specified peer over this channel
+    pub peer_messages_out_rx: futures_channel::mpsc::UnboundedReceiver<(PeerId, Packet)>,
+}
+
+#[derive(Clone, Copy)]
+struct ChannelIndex(usize);
+
+/// Forwards messages from one DataChannel over unbounded channels
+pub struct UnboundedDataChannelReceiver {
+    channel: ChannelIndex,
+    messages_from_peers_tx: UnboundedSender<(PeerId, PeerMessage)>,
+    peer: Arc<UnboundedPeerReceiver>,
+}
+
+/// Forwards messages from all channels for a given peer
+pub struct UnboundedPeerReceiver {
+    remote_id: PeerId,
+    connecting_count: AtomicUsize,
+    closed: AtomicBool,
+}
+
+pub enum PeerMessage {
+    /// The peer has finished joining (all channels connected) and is ready to send and receive messages.
+    Join,
+    /// Connection to the peer has closed or started closing (at least one channel not ready).
+    Close,
+    /// Data from peer
+    Packet(ChannelIndex, Packet),
+    /// Error from peer
+    Error(ChannelIndex, String),
+}
+
+impl UnboundedDataChannelReceiver {
+    pub fn channels_for_peer(
+        remote_id: PeerId,
+        config: &[ChannelConfig],
+        messages_from_peers_tx: UnboundedSender<(PeerId, PeerMessage)>,
+    ) -> Vec<ChannelBuilder<UnboundedDataChannelReceiver>> {
+        assert!(config.len() > 0);
+        let peer = UnboundedPeerReceiver {
+            remote_id,
+            connecting_count: config.len().into(),
+            closed: false.into(),
+        };
+        let peer = Arc::new(peer);
+
+        config
+            .iter()
+            .enumerate()
+            .map(|(channel, channel_config)| ChannelBuilder {
+                channel_config: channel_config.clone(),
+                event_handlers: UnboundedDataChannelReceiver {
+                    channel: ChannelIndex(channel),
+                    peer: peer.clone(),
+                    messages_from_peers_tx: messages_from_peers_tx.clone(),
+                },
+            })
+            .collect()
+    }
+
+    fn send(&mut self, msg: PeerMessage) {
+        self.messages_from_peers_tx
+            .unbounded_send((self.peer.remote_id, msg))
+            .unwrap();
+    }
+}
+
+impl DataChannelEventReceiver for UnboundedDataChannelReceiver {
+    fn on_open(&mut self) {
+        // Decrement number of connecting_count
+        let old = self
+            .peer
+            .connecting_count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+
+        if old == 1 {
+            // If this is the last channel to connect based on connecting_count, send Join message.
+            self.send(PeerMessage::Join);
+        }
+    }
+
+    fn on_close(&mut self) {
+        // Set closed to true
+        let old = self
+            .peer
+            .closed
+            .swap(true, std::sync::atomic::Ordering::AcqRel);
+
+        if !old {
+            // If closed was false, this is first channel closing for this peer, so send event
+            self.send(PeerMessage::Close);
+        }
+    }
+
+    fn on_error(&mut self, message: String) {
+        warn!("data channel error {message}");
+        self.send(PeerMessage::Error(self.channel, message))
+    }
+
+    fn on_message(&mut self, packet: Packet) {
+        self.send(PeerMessage::Packet(self.channel, packet))
+    }
 }
 
 async fn run_socket(
     id_tx: futures_channel::oneshot::Sender<PeerId>,
     config: SocketConfig,
-    peer_messages_out_rx: Vec<futures_channel::mpsc::UnboundedReceiver<(PeerId, Packet)>>,
-    peer_state_tx: futures_channel::mpsc::UnboundedSender<(PeerId, PeerState)>,
-    messages_from_peers_tx: Vec<futures_channel::mpsc::UnboundedSender<(PeerId, Packet)>>,
+    channels: Vec<MessageLoopChannel>,
 ) -> Result<(), SignalingError> {
     debug!("Starting WebRtcSocket");
 
@@ -963,14 +1230,10 @@ async fn run_socket(
     let channels = MessageLoopChannels {
         requests_sender,
         events_receiver,
-        peer_messages_out_rx,
-        peer_state_tx,
-        messages_from_peers_tx,
     };
     let message_loop_fut = message_loop::<UseMessenger>(
         id_tx,
         &config.ice_server,
-        &config.channels,
         channels,
         config.keep_alive_interval,
     );

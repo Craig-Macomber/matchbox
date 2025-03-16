@@ -1,5 +1,9 @@
+//! The webrtc_socket module provides a unified API for dealing with WebRtc on both native and wasm builds.
+//! This common API only implements behaviors needed by the rest of matchbox_socket: it is not a general WebRtc abstraction.
+
 pub(crate) mod error;
 mod messages;
+mod platform_abstraction;
 mod signal_peer;
 mod socket;
 
@@ -8,7 +12,7 @@ use crate::{webrtc_socket::signal_peer::SignalPeer, Error};
 use async_trait::async_trait;
 use cfg_if::cfg_if;
 use futures::{future::Either, stream::FuturesUnordered, Future, FutureExt, StreamExt};
-use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures_channel::mpsc::UnboundedReceiver;
 use futures_timer::Delay;
 use futures_util::select;
 use log::{debug, error, warn};
@@ -18,6 +22,7 @@ pub(crate) use socket::MessageLoopChannels;
 pub use socket::{
     ChannelConfig, PeerState, RtcIceServerConfig, WebRtcChannel, WebRtcSocket, WebRtcSocketBuilder,
 };
+use socket::{PeerMessage, SocketConfig, UnboundedDataChannelReceiver};
 use std::{collections::HashMap, pin::Pin, time::Duration};
 
 cfg_if! {
@@ -108,45 +113,70 @@ struct HandshakeResult<D: PeerDataSender, M> {
     metadata: M,
 }
 
+/// A [RTCDataChannel](https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel).
+/// A connection to a single peer for a single channel.
+///
+/// Inbound events are bound via [DataChannelEventReceiver].
+pub(crate) trait MatchboxDataChannel: PeerDataSender {
+    fn buffered_amount(&self) -> usize;
+}
+
+/// A platform abstraction for the subset of Web Rtc APIs needed by matchbox_socket
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-trait Messenger {
-    type DataChannel: PeerDataSender;
+trait Messenger<Tx: DataChannelEventReceiver> {
+    type DataChannel: MatchboxDataChannel;
     type HandshakeMeta: Send;
 
     async fn offer_handshake(
         signal_peer: SignalPeer,
         mut peer_signal_rx: UnboundedReceiver<PeerSignal>,
-        messages_from_peers_tx: Vec<UnboundedSender<(PeerId, Packet)>>,
+        builders: Vec<ChannelBuilder<Tx>>,
         ice_server_config: &RtcIceServerConfig,
-        channel_configs: &[ChannelConfig],
     ) -> HandshakeResult<Self::DataChannel, Self::HandshakeMeta>;
 
     async fn accept_handshake(
         signal_peer: SignalPeer,
         peer_signal_rx: UnboundedReceiver<PeerSignal>,
-        messages_from_peers_tx: Vec<UnboundedSender<(PeerId, Packet)>>,
+        builders: Vec<ChannelBuilder<Tx>>,
         ice_server_config: &RtcIceServerConfig,
-        channel_configs: &[ChannelConfig],
     ) -> HandshakeResult<Self::DataChannel, Self::HandshakeMeta>;
 
     async fn peer_loop(peer_uuid: PeerId, handshake_meta: Self::HandshakeMeta) -> PeerId;
 }
 
-async fn message_loop<M: Messenger>(
+struct ChannelBuilder<Tx: DataChannelEventReceiver> {
+    /// Where to send all incoming events triggered by the channel.
+    event_handlers: Tx,
+    /// Configuration for the channel to build.
+    channel_config: ChannelConfig,
+}
+
+/// Receiver for events from a [MatchboxDataChannel].
+///
+/// Receives events from a [RTCDataChannel](https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel).
+trait DataChannelEventReceiver: Send + Sync + 'static {
+    fn on_open(&mut self);
+    fn on_close(&mut self);
+    fn on_error(&mut self, message: String);
+    fn on_message(&mut self, packet: Packet);
+    /// https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/bufferedamountlow_event
+    fn on_buffered_amount_low(&mut self);
+}
+
+async fn message_loop<M: Messenger<UnboundedDataChannelReceiver>>(
     id_tx: futures_channel::oneshot::Sender<PeerId>,
-    ice_server_config: &RtcIceServerConfig,
-    channel_configs: &[ChannelConfig],
+    config: SocketConfig,
     channels: MessageLoopChannels,
     keep_alive_interval: Option<Duration>,
 ) -> Result<(), SignalingError> {
     let MessageLoopChannels {
         requests_sender,
         mut events_receiver,
-        mut peer_messages_out_rx,
-        messages_from_peers_tx,
-        peer_state_tx,
     } = channels;
+
+    let (messages_from_peers_tx, messages_from_peers) =
+        futures_channel::mpsc::unbounded::<(PeerId, PeerMessage)>();
 
     let mut handshakes = FuturesUnordered::new();
     let mut peer_loops = FuturesUnordered::new();
@@ -162,14 +192,6 @@ async fn message_loop<M: Messenger>(
     .fuse();
 
     loop {
-        let mut next_peer_messages_out = peer_messages_out_rx
-            .iter_mut()
-            .enumerate()
-            .map(|(channel, rx)| async move { (channel, rx.next().await) })
-            .collect::<FuturesUnordered<_>>();
-
-        let mut next_peer_message_out = next_peer_messages_out.next().fuse();
-
         select! {
             _  = &mut timeout => {
                 if requests_sender.unbounded_send(PeerRequest::KeepAlive).is_err() {
@@ -197,7 +219,8 @@ async fn message_loop<M: Messenger>(
                             let (signal_tx, signal_rx) = futures_channel::mpsc::unbounded();
                             handshake_signals.insert(peer_uuid, signal_tx);
                             let signal_peer = SignalPeer::new(peer_uuid, requests_sender.clone());
-                            handshakes.push(M::offer_handshake(signal_peer, signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs))
+                            let builders = UnboundedDataChannelReceiver::channels_for_peer(peer_uuid,&config.channels, messages_from_peers_tx.clone());
+                            handshakes.push(M::offer_handshake(signal_peer, signal_rx, builders, &config.ice_server))
                         },
                         PeerEvent::PeerLeft(peer_uuid) => {
                             if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected)).is_err() {
@@ -209,7 +232,8 @@ async fn message_loop<M: Messenger>(
                             let signal_tx = handshake_signals.entry(sender).or_insert_with(|| {
                                 let (from_peer_tx, peer_signal_rx) = futures_channel::mpsc::unbounded();
                                 let signal_peer = SignalPeer::new(sender, requests_sender.clone());
-                                handshakes.push(M::accept_handshake(signal_peer, peer_signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs));
+                                let builders = UnboundedDataChannelReceiver::channels_for_peer(sender,&config.channels, messages_from_peers_tx.clone());
+                                handshakes.push(M::accept_handshake(signal_peer, peer_signal_rx, builders, &config.ice_server));
                                 from_peer_tx
                             });
 
