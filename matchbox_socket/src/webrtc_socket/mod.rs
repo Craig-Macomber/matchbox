@@ -3,7 +3,6 @@
 
 pub(crate) mod error;
 mod messages;
-mod platform_abstraction;
 mod signal_peer;
 mod socket;
 
@@ -11,8 +10,15 @@ use self::error::SignalingError;
 use crate::{webrtc_socket::signal_peer::SignalPeer, Error};
 use async_trait::async_trait;
 use cfg_if::cfg_if;
-use futures::{future::Either, stream::FuturesUnordered, Future, FutureExt, StreamExt};
-use futures_channel::mpsc::UnboundedReceiver;
+use futures::{
+    future::{Either, Fuse},
+    stream::FuturesUnordered,
+    Future, FutureExt, SinkExt, StreamExt,
+};
+use futures_channel::{
+    mpsc::UnboundedReceiver,
+    oneshot::{self, Canceled},
+};
 use futures_timer::Delay;
 use futures_util::select;
 use log::{debug, error, warn};
@@ -23,7 +29,7 @@ pub use socket::{
     ChannelConfig, PeerState, RtcIceServerConfig, WebRtcChannel, WebRtcSocket, WebRtcSocketBuilder,
 };
 use socket::{PeerMessage, SocketConfig, UnboundedDataChannelReceiver};
-use std::{collections::HashMap, pin::Pin, time::Duration};
+use std::{collections::HashMap, pin::Pin};
 
 cfg_if! {
     if #[cfg(target_arch = "wasm32")] {
@@ -43,6 +49,7 @@ cfg_if! {
     }
 }
 
+/// Connection to a matchbox_signaling server.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 trait Signaller: Sized {
@@ -107,9 +114,8 @@ trait PeerDataSender {
     fn send(&mut self, packet: Packet) -> Result<(), PacketSendError>;
 }
 
-struct HandshakeResult<D: PeerDataSender, M> {
+struct HandshakeResult<M> {
     peer_id: PeerId,
-    data_channels: Vec<D>,
     metadata: M,
 }
 
@@ -133,14 +139,16 @@ trait Messenger<Tx: DataChannelEventReceiver> {
         mut peer_signal_rx: UnboundedReceiver<PeerSignal>,
         builders: Vec<ChannelBuilder<Tx>>,
         ice_server_config: &RtcIceServerConfig,
-    ) -> HandshakeResult<Self::DataChannel, Self::HandshakeMeta>;
+        data_channels_ready_fut: Pin<Box<Fuse<impl Future<Output = Result<(), Canceled>>>>>,
+    ) -> HandshakeResult<Self::HandshakeMeta>;
 
     async fn accept_handshake(
         signal_peer: SignalPeer,
         peer_signal_rx: UnboundedReceiver<PeerSignal>,
         builders: Vec<ChannelBuilder<Tx>>,
         ice_server_config: &RtcIceServerConfig,
-    ) -> HandshakeResult<Self::DataChannel, Self::HandshakeMeta>;
+        data_channels_ready_fut: Pin<Box<Fuse<impl Future<Output = Result<(), Canceled>>>>>,
+    ) -> HandshakeResult<Self::HandshakeMeta>;
 
     async fn peer_loop(peer_uuid: PeerId, handshake_meta: Self::HandshakeMeta) -> PeerId;
 }
@@ -168,28 +176,54 @@ async fn message_loop<M: Messenger<UnboundedDataChannelReceiver>>(
     id_tx: futures_channel::oneshot::Sender<PeerId>,
     config: SocketConfig,
     channels: MessageLoopChannels,
-    keep_alive_interval: Option<Duration>,
 ) -> Result<(), SignalingError> {
     let MessageLoopChannels {
         requests_sender,
         mut events_receiver,
+        mut message_sender,
     } = channels;
 
-    let (messages_from_peers_tx, messages_from_peers) =
+    let (messages_from_peers_tx, mut messages_from_peers) =
         futures_channel::mpsc::unbounded::<(PeerId, PeerMessage)>();
 
-    let mut handshakes = FuturesUnordered::new();
-    let mut peer_loops = FuturesUnordered::new();
-    let mut handshake_signals = HashMap::new();
-    let mut data_channels = HashMap::new();
+    let handshakes = FuturesUnordered::new();
+    let mut handshake_signals: HashMap<PeerId, futures_channel::mpsc::UnboundedSender<PeerSignal>> =
+        HashMap::new();
+
+    // TODO: might need to send errors when join fails.
+    let mut ready_signals: HashMap<PeerId, oneshot::Sender<()>> = HashMap::new();
+
     let mut id_tx = Option::Some(id_tx);
 
-    let mut timeout = if let Some(interval) = keep_alive_interval {
+    let mut timeout = if let Some(interval) = config.keep_alive_interval {
         Either::Left(Delay::new(interval))
     } else {
         Either::Right(std::future::pending())
     }
     .fuse();
+
+    let setup_peer =
+        |sender: PeerId,
+         handshake_signals: &mut HashMap<PeerId, _>,
+         ready_signals: &mut HashMap<PeerId, oneshot::Sender<()>>| {
+            let (signal_tx, signal_rx) = futures_channel::mpsc::unbounded();
+            let (ready_sender, ready_receiver) = oneshot::channel();
+            handshake_signals.insert(sender, signal_tx.clone());
+            ready_signals.insert(sender, ready_sender);
+            let signal_peer = SignalPeer::new(sender, requests_sender.clone());
+            let builders = UnboundedDataChannelReceiver::channels_for_peer(
+                sender,
+                &config.channels,
+                messages_from_peers_tx.clone(),
+            );
+            (
+                signal_peer,
+                signal_rx,
+                builders,
+                Box::pin(ready_receiver.fuse()),
+                signal_tx,
+            )
+        };
 
     loop {
         select! {
@@ -198,7 +232,7 @@ async fn message_loop<M: Messenger<UnboundedDataChannelReceiver>>(
                     // socket dropped
                     break Ok(());
                 }
-                if let Some(interval) = keep_alive_interval {
+                if let Some(interval) = config.keep_alive_interval {
                     timeout = Either::Left(Delay::new(interval)).fuse();
                 } else {
                     error!("no keep alive timeout, please file a bug");
@@ -215,25 +249,18 @@ async fn message_loop<M: Messenger<UnboundedDataChannelReceiver>>(
                                 break Ok(());
                             };
                         },
-                        PeerEvent::NewPeer(peer_uuid) => {
-                            let (signal_tx, signal_rx) = futures_channel::mpsc::unbounded();
-                            handshake_signals.insert(peer_uuid, signal_tx);
-                            let signal_peer = SignalPeer::new(peer_uuid, requests_sender.clone());
-                            let builders = UnboundedDataChannelReceiver::channels_for_peer(peer_uuid,&config.channels, messages_from_peers_tx.clone());
-                            handshakes.push(M::offer_handshake(signal_peer, signal_rx, builders, &config.ice_server))
+                        PeerEvent::NewPeer(sender) => {
+                            let (signal_peer, signal_rx, builders, ready_receiver, _from_peer_tx) = setup_peer(sender, &mut handshake_signals, &mut ready_signals);
+                            handshakes.push(M::offer_handshake(signal_peer, signal_rx, builders, &config.ice_server, ready_receiver))
                         },
                         PeerEvent::PeerLeft(peer_uuid) => {
-                            if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected)).is_err() {
-                                // socket dropped, exit cleanly
-                                break Ok(());
-                            }
+                            // TODO: Better cleanup
+                            handshake_signals.remove(&peer_uuid);
                         },
                         PeerEvent::Signal { sender, data } => {
                             let signal_tx = handshake_signals.entry(sender).or_insert_with(|| {
-                                let (from_peer_tx, peer_signal_rx) = futures_channel::mpsc::unbounded();
-                                let signal_peer = SignalPeer::new(sender, requests_sender.clone());
-                                let builders = UnboundedDataChannelReceiver::channels_for_peer(sender,&config.channels, messages_from_peers_tx.clone());
-                                handshakes.push(M::accept_handshake(signal_peer, peer_signal_rx, builders, &config.ice_server));
+                                let (signal_peer, signal_rx, builders, ready_receiver, from_peer_tx) = setup_peer(sender, &mut handshake_signals, &mut ready_signals);
+                                handshakes.push(M::accept_handshake(signal_peer, signal_rx, builders, &config.ice_server, ready_receiver), );
                                 from_peer_tx
                             });
 
@@ -245,44 +272,16 @@ async fn message_loop<M: Messenger<UnboundedDataChannelReceiver>>(
                 }
             }
 
-            handshake_result = handshakes.select_next_some() => {
-                data_channels.insert(handshake_result.peer_id, handshake_result.data_channels);
-                if peer_state_tx.unbounded_send((handshake_result.peer_id, PeerState::Connected)).is_err() {
-                    // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore
-                    break Ok(());
-                }
-                peer_loops.push(M::peer_loop(handshake_result.peer_id, handshake_result.metadata));
-            }
-
-            peer_uuid = peer_loops.select_next_some() => {
-                debug!("peer {peer_uuid} finished");
-                if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected)).is_err() {
-                    // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore
-                    break Ok(());
-                }
-            }
-
-            message = next_peer_message_out => {
+            message = messages_from_peers.next().fuse() => {
                 match message {
-                    Some((channel_index, Some((peer, packet)))) => {
-                        let data_channel = data_channels
-                            .get_mut(&peer)
-                            .expect("couldn't find data channel for peer")
-                            .get_mut(channel_index).unwrap_or_else(|| panic!("couldn't find data channel with index {channel_index}"));
-                        if let Err(e) = data_channel.send(packet) {
-                            // Peer we're sending to closed their end of the connection.
-                            // We anticipate the PeerLeft event soon, but we sent a message before it came.
-                            // Do nothing. Only log it.
-                            warn!("failed to send to peer {peer} (socket closed): {e:?}");
-                        };
+                    Some(m)=>{
+                        if let (peer,PeerMessage::Join) = m {
+                            ready_signals.remove(&peer).unwrap().send(());
+                        }
+                        message_sender.send(m);
                     }
-                    Some((_, None)) | None => {
-                        // Receiver end of outgoing message channel closed,
-                        // which most likely means the socket was dropped.
-                        // There could probably be cleaner ways to handle this,
-                        // but for now, just exit cleanly.
-                        warn!("Outgoing message queue closed, message not sent");
-                        break Ok(());
+                    None => {
+                        message_sender.close_channel();
                     }
                 }
             }

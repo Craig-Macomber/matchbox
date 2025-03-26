@@ -1,6 +1,6 @@
 use super::{
     error::{ChannelError, SignalingError},
-    ChannelBuilder, DataChannelEventReceiver,
+    ChannelBuilder, DataChannelEventReceiver, MatchboxDataChannel,
 };
 use crate::{
     webrtc_socket::{
@@ -10,17 +10,23 @@ use crate::{
     Error,
 };
 use bytes::Bytes;
+use derive_more::derive::Display;
 use futures::{
     future::Either, select, stream::FuturesUnordered, AsyncRead, AsyncWrite, Future, FutureExt,
     Sink, SinkExt, Stream, StreamExt, TryStreamExt,
 };
-use futures_channel::mpsc::{SendError, TrySendError, UnboundedReceiver, UnboundedSender};
+use futures_channel::mpsc::{
+    unbounded, SendError, TrySendError, UnboundedReceiver, UnboundedSender,
+};
 use futures_timer::Delay;
 use log::{debug, error, warn};
 use matchbox_protocol::PeerId;
+use parking_lot::Mutex;
 use std::{
-    collections::HashMap,
+    collections::{hash_map::OccupiedEntry, HashMap},
+    fmt::Display,
     future::ready,
+    mem::{replace, swap, take},
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicUsize},
@@ -205,10 +211,22 @@ impl WebRtcSocketBuilder {
     ///
     /// The returned [`MessageLoopFuture`] should be awaited in order for messages to be sent and
     /// received.
+    pub fn build_simple(
+        self,
+    ) -> modname::SimpleWebRtc<
+        impl Stream<Item = WebRtcMessage>,
+        Sink<(ChannelIndex, PeerId, Packet)>,
+    > {
+        self.validate();
+    }
+
+    /// Creates a [`WebRtcSocket`] and the corresponding [`MessageLoopFuture`] according to the
+    /// configuration supplied.
+    ///
+    /// The returned [`MessageLoopFuture`] should be awaited in order for messages to be sent and
+    /// received.
     pub fn build(self) -> (WebRtcSocket, MessageLoopFuture) {
         self.validate();
-
-        let (peer_state_tx, peer_state_rx) = futures_channel::mpsc::unbounded();
 
         let mut peer_messages_out_rx = Vec::with_capacity(self.config.channels.len());
         let mut messages_from_peers_tx = Vec::with_capacity(self.config.channels.len());
@@ -229,31 +247,30 @@ impl WebRtcSocketBuilder {
 
         let (id_tx, id_rx) = futures_channel::oneshot::channel();
 
-        let socket_fut = run_socket(
-            id_tx,
-            self.config,
-            peer_messages_out_rx,
-            messages_from_peers_tx,
-        )
-        // Transform the source into a user-error.
-        .map(|f| {
-            f.map_err(|e| match e {
-                SignalingError::UndeliverableSignal(e) => Error::Disconnected(e.into()),
-                SignalingError::NegotiationFailed(e) => Error::ConnectionFailed(*e),
-                SignalingError::WebSocket(e) => Error::Disconnected(e.into()),
-                SignalingError::UnknownFormat | SignalingError::StreamExhausted => {
-                    unimplemented!("these errors should never be propagated here")
-                }
-            })
-        });
+        let (messages_from_peers_tx, messages_from_peers) =
+            futures_channel::mpsc::unbounded::<(PeerId, PeerMessage)>();
+
+        let socket_fut = run_socket(id_tx, messages_from_peers_tx, self.config.clone())
+            // Transform the source into a user-error.
+            .map(|f| {
+                f.map_err(|e| match e {
+                    SignalingError::UndeliverableSignal(e) => Error::Disconnected(e.into()),
+                    SignalingError::NegotiationFailed(e) => Error::ConnectionFailed(*e),
+                    SignalingError::WebSocket(e) => Error::Disconnected(e.into()),
+                    SignalingError::UnknownFormat | SignalingError::StreamExhausted => {
+                        unimplemented!("these errors should never be propagated here")
+                    }
+                })
+            });
 
         (
             WebRtcSocket {
                 id: Default::default(),
                 id_rx,
-                peer_state_rx,
+                messages_from_peers,
                 peers: Default::default(),
                 channels,
+                peer_changes,
             },
             Box::pin(socket_fut),
         )
@@ -449,9 +466,7 @@ mod callbacks {
     use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 
     use crate::{
-        webrtc_socket::{
-            platform_abstraction::MatchboxDataChannel, PacketSendError, PeerDataSender,
-        },
+        webrtc_socket::{MatchboxDataChannel, PacketSendError},
         Packet,
     };
     pub trait Callbacks {
@@ -799,10 +814,16 @@ where
 pub struct WebRtcSocket {
     id: once_cell::race::OnceBox<PeerId>,
     id_rx: futures_channel::oneshot::Receiver<PeerId>,
-    peer_state_rx: futures_channel::mpsc::UnboundedReceiver<(PeerId, PeerState)>,
+    /// All messages for all channels come in over this channel, and are forwarded to the channels via MessageLoopFuture.
+    messages_from_peers: futures_channel::mpsc::UnboundedReceiver<(PeerId, PeerMessage)>,
     peers: HashMap<PeerId, PeerState>,
     channels: Vec<Option<WebRtcChannel>>,
+
+    /// Buffer of peer changes since last time update_peers was called.
+    peer_changes: Result<Vec<(PeerId, PeerState)>, ChannelError>,
 }
+
+mod simple;
 
 impl WebRtcSocket {
     /// Creates a new builder for a connection to a given room with a given number of
@@ -878,20 +899,10 @@ impl WebRtcSocket {
     /// Similar to [`WebRtcSocket::update_peers`]. Will instead return a Result::Err if the
     /// socket is closed.
     pub fn try_update_peers(&mut self) -> Result<Vec<(PeerId, PeerState)>, ChannelError> {
-        let mut changes = Vec::new();
-        while let Ok(res) = self.peer_state_rx.try_next() {
-            match res {
-                Some((id, state)) => {
-                    let old = self.peers.insert(id, state);
-                    if old != Some(state) {
-                        changes.push((id, state));
-                    }
-                }
-                None => return Err(ChannelError::Closed),
-            }
+        match &mut self.peer_changes {
+            Ok(v) => Ok(replace(v, vec![])),
+            Err(e) => Err(e.clone()),
         }
-
-        Ok(changes)
     }
 
     /// Returns an iterator of the ids of the connected peers.
@@ -1101,6 +1112,7 @@ impl WebRtcSocket {
 pub struct MessageLoopChannels {
     pub requests_sender: futures_channel::mpsc::UnboundedSender<PeerRequest>,
     pub events_receiver: futures_channel::mpsc::UnboundedReceiver<PeerEvent>,
+    pub message_sender: UnboundedSender<(PeerId, PeerMessage)>,
 }
 
 /// Merges messages from all peers for a given channel
@@ -1110,7 +1122,7 @@ struct MessageLoopChannel {
     pub peer_messages_out_rx: futures_channel::mpsc::UnboundedReceiver<(PeerId, Packet)>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Display, Eq, PartialEq, Hash)]
 struct ChannelIndex(usize);
 
 /// Forwards messages from one DataChannel over unbounded channels
@@ -1212,8 +1224,8 @@ impl DataChannelEventReceiver for UnboundedDataChannelReceiver {
 
 async fn run_socket(
     id_tx: futures_channel::oneshot::Sender<PeerId>,
+    message_sender: UnboundedSender<(PeerId, PeerMessage)>,
     config: SocketConfig,
-    channels: Vec<MessageLoopChannel>,
 ) -> Result<(), SignalingError> {
     debug!("Starting WebRtcSocket");
 
@@ -1222,7 +1234,7 @@ async fn run_socket(
 
     let signaling_loop_fut = signaling_loop::<UseSignaller>(
         config.attempts,
-        config.room_url,
+        config.room_url.clone(),
         requests_receiver,
         events_sender,
     );
@@ -1230,13 +1242,9 @@ async fn run_socket(
     let channels = MessageLoopChannels {
         requests_sender,
         events_receiver,
+        message_sender,
     };
-    let message_loop_fut = message_loop::<UseMessenger>(
-        id_tx,
-        &config.ice_server,
-        channels,
-        config.keep_alive_interval,
-    );
+    let message_loop_fut = message_loop::<UseMessenger>(id_tx, config.clone(), channels);
 
     let mut message_loop_done = Box::pin(message_loop_fut.fuse());
     let mut signaling_loop_done = Box::pin(signaling_loop_fut.fuse());

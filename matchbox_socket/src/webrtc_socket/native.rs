@@ -3,8 +3,8 @@ use super::{
 };
 use crate::{
     webrtc_socket::{
-        error::SignalingError, messages::PeerSignal, signal_peer::SignalPeer, ChannelConfig,
-        Messenger, Packet, Signaller,
+        error::SignalingError, messages::PeerSignal, signal_peer::SignalPeer, Messenger, Packet,
+        Signaller,
     },
     RtcIceServerConfig,
 };
@@ -16,12 +16,8 @@ use async_tungstenite::{
     WebSocketStream,
 };
 use bytes::Bytes;
-use futures::{
-    future::{Fuse, FusedFuture},
-    stream::FuturesUnordered,
-    Future, FutureExt, StreamExt,
-};
-use futures_channel::mpsc::{Receiver, TrySendError, UnboundedReceiver, UnboundedSender};
+use futures::{future::Fuse, stream::FuturesUnordered, Future, FutureExt, StreamExt};
+use futures_channel::mpsc::{TrySendError, UnboundedReceiver, UnboundedSender};
 use futures_timer::Delay;
 use futures_util::{lock::Mutex, select};
 use log::{debug, error, info, trace, warn};
@@ -102,19 +98,15 @@ impl PeerDataSender for UnboundedSender<Packet> {
 #[async_trait]
 impl<Tx: DataChannelEventReceiver> Messenger<Tx> for NativeMessenger {
     type DataChannel = UnboundedSender<Packet>;
-    type HandshakeMeta = (
-        Vec<UnboundedReceiver<Packet>>,
-        Vec<Arc<RTCDataChannel>>,
-        Pin<Box<dyn FusedFuture<Output = Result<(), webrtc::Error>> + Send>>,
-        Receiver<()>,
-    );
+    type HandshakeMeta = ();
 
     async fn offer_handshake(
         signal_peer: SignalPeer,
         mut peer_signal_rx: UnboundedReceiver<PeerSignal>,
         builders: Vec<ChannelBuilder<Tx>>,
         ice_server_config: &RtcIceServerConfig,
-    ) -> HandshakeResult<Self::DataChannel, Self::HandshakeMeta> {
+        data_channels_ready_fut: Pin<Box<Fuse<impl Future<Output = ()>>>>,
+    ) -> HandshakeResult<Self::HandshakeMeta> {
         async {
             debug!("making offer");
             let (connection, trickle) =
@@ -163,15 +155,9 @@ impl<Tx: DataChannelEventReceiver> Messenger<Tx> for NativeMessenger {
             )
             .await;
 
-            HandshakeResult::<Self::DataChannel, Self::HandshakeMeta> {
+            HandshakeResult::<Self::HandshakeMeta> {
                 peer_id: signal_peer.id,
-                data_channels: to_peer_message_tx,
-                metadata: (
-                    to_peer_message_rx,
-                    data_channels,
-                    trickle_fut,
-                    peer_disconnected_rx,
-                ),
+                metadata: (),
             }
         }
         .compat() // Required to run tokio futures with other async executors
@@ -181,33 +167,18 @@ impl<Tx: DataChannelEventReceiver> Messenger<Tx> for NativeMessenger {
     async fn accept_handshake(
         signal_peer: SignalPeer,
         mut peer_signal_rx: UnboundedReceiver<PeerSignal>,
-        messages_from_peers_tx: Vec<UnboundedSender<(PeerId, Packet)>>,
+        builders: Vec<ChannelBuilder<Tx>>,
         ice_server_config: &RtcIceServerConfig,
-        channel_configs: &[ChannelConfig],
-    ) -> HandshakeResult<Self::DataChannel, Self::HandshakeMeta> {
+        data_channels_ready_fut: Pin<Box<Fuse<impl Future<Output = ()>>>>,
+    ) -> HandshakeResult<Self::HandshakeMeta> {
         async {
-            let (to_peer_message_tx, to_peer_message_rx) =
-                new_senders_and_receivers(channel_configs);
-            let (peer_disconnected_tx, peer_disconnected_rx) = futures_channel::mpsc::channel(1);
-
             debug!("handshake_accept");
             let (connection, trickle) =
                 create_rtc_peer_connection(signal_peer.clone(), ice_server_config)
                     .await
                     .unwrap();
 
-            let (data_channel_ready_txs, data_channels_ready_fut) =
-                create_data_channels_ready_fut(channel_configs);
-
-            let data_channels = create_data_channels(
-                &connection,
-                data_channel_ready_txs,
-                signal_peer.id,
-                peer_disconnected_tx.clone(),
-                messages_from_peers_tx,
-                channel_configs,
-            )
-            .await;
+            let data_channels = create_data_channels(&connection, builders).await;
 
             let offer = loop {
                 match peer_signal_rx.next().await.expect("error") {
@@ -238,15 +209,9 @@ impl<Tx: DataChannelEventReceiver> Messenger<Tx> for NativeMessenger {
             )
             .await;
 
-            HandshakeResult::<Self::DataChannel, Self::HandshakeMeta> {
+            HandshakeResult::<Self::HandshakeMeta> {
                 peer_id: signal_peer.id,
-                data_channels: to_peer_message_tx,
-                metadata: (
-                    to_peer_message_rx,
-                    data_channels,
-                    trickle_fut,
-                    peer_disconnected_rx,
-                ),
+                metadata: (),
             }
         }
         .compat() // Required to run tokio futures with other async executors
