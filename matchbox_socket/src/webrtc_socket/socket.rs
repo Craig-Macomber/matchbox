@@ -206,18 +206,10 @@ impl WebRtcSocketBuilder {
         );
     }
 
-    /// Creates a [`WebRtcSocket`] and the corresponding [`MessageLoopFuture`] according to the
-    /// configuration supplied.
-    ///
-    /// The returned [`MessageLoopFuture`] should be awaited in order for messages to be sent and
-    /// received.
-    pub fn build_simple(
-        self,
-    ) -> modname::SimpleWebRtc<
-        impl Stream<Item = WebRtcMessage>,
-        Sink<(ChannelIndex, PeerId, Packet)>,
-    > {
+    /// Start connecting to the Signaler with this [SocketConfig].
+    pub fn build_async(self) -> impl Future<Output = simple2::Connection> {
         self.validate();
+        async { todo!() }
     }
 
     /// Creates a [`WebRtcSocket`] and the corresponding [`MessageLoopFuture`] according to the
@@ -824,6 +816,7 @@ pub struct WebRtcSocket {
 }
 
 mod simple;
+mod simple2;
 
 impl WebRtcSocket {
     /// Creates a new builder for a connection to a given room with a given number of
