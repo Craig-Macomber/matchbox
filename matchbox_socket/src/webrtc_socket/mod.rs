@@ -91,14 +91,14 @@ pub type Packet = Box<[u8]>;
 /// Errors that can happen when sending packets
 #[derive(Debug, thiserror::Error)]
 #[error("The socket was dropped and package could not be sent")]
-struct PacketSendError {
+pub struct PacketSendError {
     #[cfg(not(target_arch = "wasm32"))]
     source: futures_channel::mpsc::SendError,
     #[cfg(target_arch = "wasm32")]
     source: error::JsError,
 }
 
-trait PeerDataSender {
+pub(crate) trait PeerDataSender {
     fn send(&mut self, packet: Packet) -> Result<(), PacketSendError>;
 }
 
@@ -106,6 +106,26 @@ struct HandshakeResult<D: PeerDataSender, M> {
     peer_id: PeerId,
     data_channels: Vec<D>,
     metadata: M,
+}
+
+/// A [RTCDataChannel](https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel).
+/// A connection to a single peer for a single channel.
+///
+/// Inbound events are bound via [DataChannelEventReceiver].
+pub(crate) trait MatchboxDataChannel: PeerDataSender {
+    // See [futures::Sink::poll_flush].
+    fn poll_buffer_low(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), PacketSendError>>;
+
+    /// Start the closing process, wake when done.
+    /// See [RTCDataChannel.close](https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/close)
+    /// and [futures::Sink::poll_close].
+    fn poll_close(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), PacketSendError>>;
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
