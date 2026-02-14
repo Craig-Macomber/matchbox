@@ -825,8 +825,8 @@ async fn run_socket(
 
     let signaling_loop_fut = signaling_loop(
         builder,
-        config.attempts,
-        config.room_url,
+        config.attempts.clone(),
+        config.room_url.clone(),
         requests_receiver,
         events_sender,
     );
@@ -838,13 +838,7 @@ async fn run_socket(
         peer_state_tx,
         messages_from_peers_tx,
     };
-    let message_loop_fut = message_loop::<UseMessenger>(
-        id_tx,
-        &config.ice_server,
-        &config.channels,
-        channels,
-        config.keep_alive_interval,
-    );
+    let message_loop_fut = message_loop::<UseMessenger>(id_tx, config, channels);
 
     let mut message_loop_done = Box::pin(message_loop_fut.fuse());
     let mut signaling_loop_done = Box::pin(signaling_loop_fut.fuse());

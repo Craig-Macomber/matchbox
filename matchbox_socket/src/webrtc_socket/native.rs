@@ -5,8 +5,8 @@ use super::{
 use crate::{
     RtcIceServerConfig,
     webrtc_socket::{
-        ChannelConfig, Messenger, Packet, Signaller, error::SignalingError, messages::PeerSignal,
-        signal_peer::SignalPeer, socket::create_data_channels_ready_fut,
+        ChannelBuilder, DataChannelEventReceiver, Messenger, Packet, Signaller,
+        error::SignalingError, messages::PeerSignal, signal_peer::SignalPeer,
     },
 };
 use async_compat::CompatExt;
@@ -16,17 +16,14 @@ use async_tungstenite::{
     async_std::{ConnectStream, connect_async},
     tungstenite::Message,
 };
-use bytes::Bytes;
-use futures::{
-    Future, FutureExt, StreamExt,
-    future::{Fuse, FusedFuture},
-    stream::FuturesUnordered,
+use futures::{Future, FutureExt, StreamExt, future::Fuse};
+use futures_channel::{
+    mpsc::{TrySendError, UnboundedReceiver, UnboundedSender},
+    oneshot::Canceled,
 };
-use futures_channel::mpsc::{Receiver, Sender, TrySendError, UnboundedReceiver, UnboundedSender};
 use futures_timer::Delay;
 use futures_util::{lock::Mutex, select};
 use log::{debug, error, info, trace, warn};
-use matchbox_protocol::PeerId;
 use std::{pin::Pin, sync::Arc, time::Duration};
 use webrtc::{
     api::APIBuilder,
@@ -119,45 +116,27 @@ impl PeerDataSender for UnboundedSender<Packet> {
 }
 
 #[async_trait]
-impl Messenger for NativeMessenger {
+impl<Tx: DataChannelEventReceiver> Messenger<Tx> for NativeMessenger {
     type DataChannel = UnboundedSender<Packet>;
-    type HandshakeMeta = (
-        Vec<UnboundedReceiver<Packet>>,
-        Vec<Arc<RTCDataChannel>>,
-        Pin<Box<dyn FusedFuture<Output = Result<(), webrtc::Error>> + Send>>,
-        Receiver<()>,
-    );
+    type HandshakeMeta = ();
 
     async fn offer_handshake(
         signal_peer: SignalPeer,
         mut peer_signal_rx: UnboundedReceiver<PeerSignal>,
-        messages_from_peers_tx: Vec<UnboundedSender<(PeerId, Packet)>>,
+        builders: Vec<ChannelBuilder<Tx>>,
         ice_server_config: &RtcIceServerConfig,
-        channel_configs: &[ChannelConfig],
-    ) -> HandshakeResult<Self::DataChannel, Self::HandshakeMeta> {
+        data_channels_ready_fut: Pin<
+            Box<Fuse<impl Future<Output = Result<(), Canceled>> + std::marker::Send>>,
+        >,
+    ) -> HandshakeResult<Self::HandshakeMeta> {
         async {
-            let (to_peer_message_tx, to_peer_message_rx) =
-                new_senders_and_receivers(channel_configs);
-            let (peer_disconnected_tx, peer_disconnected_rx) = futures_channel::mpsc::channel(1);
-
             debug!("making offer");
             let (connection, trickle) =
                 create_rtc_peer_connection(signal_peer.clone(), ice_server_config)
                     .await
                     .unwrap();
 
-            let (data_channel_ready_txs, data_channels_ready_fut) =
-                create_data_channels_ready_fut(channel_configs);
-
-            let data_channels = create_data_channels(
-                &connection,
-                data_channel_ready_txs,
-                signal_peer.id,
-                peer_disconnected_tx,
-                messages_from_peers_tx,
-                channel_configs,
-            )
-            .await;
+            create_data_channels(&connection, builders).await;
 
             // TODO: maybe pass in options? ice restart etc.?
             let offer = connection.create_offer(None).await.unwrap();
@@ -190,7 +169,7 @@ impl Messenger for NativeMessenger {
                 .await
                 .unwrap();
 
-            let trickle_fut = complete_handshake(
+            complete_handshake(
                 trickle,
                 &connection,
                 peer_signal_rx,
@@ -198,15 +177,9 @@ impl Messenger for NativeMessenger {
             )
             .await;
 
-            HandshakeResult::<Self::DataChannel, Self::HandshakeMeta> {
+            HandshakeResult::<Self::HandshakeMeta> {
                 peer_id: signal_peer.id,
-                data_channels: to_peer_message_tx,
-                metadata: (
-                    to_peer_message_rx,
-                    data_channels,
-                    trickle_fut,
-                    peer_disconnected_rx,
-                ),
+                metadata: (),
             }
         }
         .compat() // Required to run tokio futures with other async executors
@@ -216,33 +189,20 @@ impl Messenger for NativeMessenger {
     async fn accept_handshake(
         signal_peer: SignalPeer,
         mut peer_signal_rx: UnboundedReceiver<PeerSignal>,
-        messages_from_peers_tx: Vec<UnboundedSender<(PeerId, Packet)>>,
+        builders: Vec<ChannelBuilder<Tx>>,
         ice_server_config: &RtcIceServerConfig,
-        channel_configs: &[ChannelConfig],
-    ) -> HandshakeResult<Self::DataChannel, Self::HandshakeMeta> {
+        data_channels_ready_fut: Pin<
+            Box<Fuse<impl Future<Output = Result<(), Canceled>> + std::marker::Send>>,
+        >,
+    ) -> HandshakeResult<Self::HandshakeMeta> {
         async {
-            let (to_peer_message_tx, to_peer_message_rx) =
-                new_senders_and_receivers(channel_configs);
-            let (peer_disconnected_tx, peer_disconnected_rx) = futures_channel::mpsc::channel(1);
-
             debug!("handshake_accept");
             let (connection, trickle) =
                 create_rtc_peer_connection(signal_peer.clone(), ice_server_config)
                     .await
                     .unwrap();
 
-            let (data_channel_ready_txs, data_channels_ready_fut) =
-                create_data_channels_ready_fut(channel_configs);
-
-            let data_channels = create_data_channels(
-                &connection,
-                data_channel_ready_txs,
-                signal_peer.id,
-                peer_disconnected_tx.clone(),
-                messages_from_peers_tx,
-                channel_configs,
-            )
-            .await;
+            create_data_channels(&connection, builders).await;
 
             let offer = loop {
                 match peer_signal_rx.next().await.expect("error") {
@@ -265,7 +225,7 @@ impl Messenger for NativeMessenger {
             signal_peer.send(PeerSignal::Answer(answer.sdp.clone()));
             connection.set_local_description(answer).await.unwrap();
 
-            let trickle_fut = complete_handshake(
+            complete_handshake(
                 trickle,
                 &connection,
                 peer_signal_rx,
@@ -273,74 +233,17 @@ impl Messenger for NativeMessenger {
             )
             .await;
 
-            HandshakeResult::<Self::DataChannel, Self::HandshakeMeta> {
+            HandshakeResult::<Self::HandshakeMeta> {
                 peer_id: signal_peer.id,
-                data_channels: to_peer_message_tx,
-                metadata: (
-                    to_peer_message_rx,
-                    data_channels,
-                    trickle_fut,
-                    peer_disconnected_rx,
-                ),
+                metadata: (),
             }
-        }
-        .compat() // Required to run tokio futures with other async executors
-        .await
-    }
-
-    async fn peer_loop(peer_uuid: PeerId, handshake_meta: Self::HandshakeMeta) -> PeerId {
-        async {
-            let (mut to_peer_message_rx, data_channels, mut trickle_fut, mut peer_disconnected) =
-                handshake_meta;
-
-            assert_eq!(
-                data_channels.len(),
-                to_peer_message_rx.len(),
-                "amount of data channels and receivers differ"
-            );
-
-            let mut message_loop_futs: FuturesUnordered<_> = data_channels
-                .iter()
-                .zip(to_peer_message_rx.iter_mut())
-                .map(|(data_channel, rx)| async move {
-                    while let Some(message) = rx.next().await {
-                        trace!("sending packet {message:?}");
-                        let message = message.clone();
-                        let message = Bytes::from(message);
-                        if let Err(e) = data_channel.send(&message).await {
-                            error!("error sending to data channel: {e:?}")
-                        }
-                    }
-                })
-                .collect();
-
-            loop {
-                select! {
-                    _ = peer_disconnected.next() => break,
-
-                    _ = message_loop_futs.next() => break,
-                    // TODO: this means that the signaling is down, should return an
-                    // error
-                    _ = trickle_fut => continue,
-                }
-            }
-
-            peer_uuid
         }
         .compat() // Required to run tokio futures with other async executors
         .await
     }
 }
 
-fn new_senders_and_receivers<T>(
-    channel_configs: &[ChannelConfig],
-) -> (Vec<UnboundedSender<T>>, Vec<UnboundedReceiver<T>>) {
-    (0..channel_configs.len())
-        .map(|_| futures_channel::mpsc::unbounded())
-        .unzip()
-}
-
-async fn complete_handshake<T: Future<Output = ()>>(
+async fn complete_handshake<T: Future<Output = Result<(), Canceled>>>(
     trickle: Arc<CandidateTrickle>,
     connection: &Arc<RTCPeerConnection>,
     peer_signal_rx: UnboundedReceiver<PeerSignal>,
@@ -491,46 +394,31 @@ async fn create_rtc_peer_connection(
     Ok((connection, trickle))
 }
 
-async fn create_data_channels(
+/// Create channels for a newly connected peer
+async fn create_data_channels<Tx: DataChannelEventReceiver>(
     connection: &RTCPeerConnection,
-    mut data_channel_ready_txs: Vec<futures_channel::mpsc::Sender<()>>,
-    peer_id: PeerId,
-    peer_disconnected_tx: Sender<()>,
-    from_peer_message_tx: Vec<UnboundedSender<(PeerId, Packet)>>,
-    channel_configs: &[ChannelConfig],
+    channels_builders: Vec<ChannelBuilder<Tx>>,
 ) -> Vec<Arc<RTCDataChannel>> {
-    let mut channels = vec![];
-    for (i, channel_config) in channel_configs.iter().enumerate() {
-        let channel = create_data_channel(
-            connection,
-            data_channel_ready_txs.pop().unwrap(),
-            peer_id,
-            peer_disconnected_tx.clone(),
-            from_peer_message_tx.get(i).unwrap().clone(),
-            channel_config,
-            i,
-        )
-        .await;
+    let channels = channels_builders
+        .into_iter()
+        .enumerate()
+        .map(|(i, b)| create_data_channel(connection, b, i));
 
-        channels.push(channel);
-    }
+    let results = futures::future::join_all(channels).await;
 
-    channels
+    results
 }
 
-async fn create_data_channel(
+/// Create a channel for a newly connected peer
+async fn create_data_channel<Tx: DataChannelEventReceiver>(
     connection: &RTCPeerConnection,
-    mut channel_ready: futures_channel::mpsc::Sender<()>,
-    peer_id: PeerId,
-    mut peer_disconnected_tx: Sender<()>,
-    from_peer_message_tx: UnboundedSender<(PeerId, Packet)>,
-    channel_config: &ChannelConfig,
+    builder: ChannelBuilder<Tx>,
     channel_index: usize,
 ) -> Arc<RTCDataChannel> {
     let config = RTCDataChannelInit {
-        ordered: Some(channel_config.ordered),
+        ordered: Some(builder.channel_config.ordered),
         negotiated: Some(channel_index as u16),
-        max_retransmits: channel_config.max_retransmits,
+        max_retransmits: builder.channel_config.max_retransmits,
         ..Default::default()
     };
 
@@ -539,39 +427,41 @@ async fn create_data_channel(
         .await
         .unwrap();
 
-    channel.on_open(Box::new(move || {
-        debug!("Data channel ready");
-        Box::pin(async move {
-            channel_ready.try_send(()).unwrap();
-        })
-    }));
+    let messenger = Arc::new(std::sync::Mutex::new(builder.event_handlers));
 
     {
-        channel.on_close(Box::new(move || {
-            debug!("Data channel closed");
-            if let Err(err) = peer_disconnected_tx.try_send(()) {
-                // should only happen if the socket is dropped, or we are out of memory
-                warn!("failed to notify about data channel closing: {err:?}");
-            }
-            Box::pin(async move {})
+        let messenger = messenger.clone();
+        channel.on_open(Box::new(move || {
+            debug!("Data channel open");
+            messenger.lock().unwrap().on_open();
+            Box::pin(async {})
         }));
     }
-
-    channel.on_error(Box::new(move |e| {
-        // TODO: handle this somehow
-        warn!("data channel error {e:?}");
-        Box::pin(async move {})
-    }));
-
-    channel.on_message(Box::new(move |message| {
-        let packet = (*message.data).into();
-        trace!("data channel message received: {packet:?}");
-        if let Err(e) = from_peer_message_tx.unbounded_send((peer_id, packet)) {
-            // should only happen if the socket is dropped, or we are out of memory
-            warn!("failed to notify about data channel message: {e:?}");
-        }
-        Box::pin(async move {})
-    }));
+    {
+        let messenger = messenger.clone();
+        channel.on_close(Box::new(move || {
+            debug!("Data channel close");
+            messenger.lock().unwrap().on_close();
+            Box::pin(async {})
+        }));
+    }
+    {
+        let messenger = messenger.clone();
+        channel.on_error(Box::new(move |e| {
+            debug!("Data channel error");
+            messenger.lock().unwrap().on_error(format!("{e:?}"));
+            Box::pin(async {})
+        }));
+    }
+    {
+        let messenger = messenger.clone();
+        channel.on_message(Box::new(move |message| {
+            let packet = (*message.data).into();
+            trace!("data channel message received: {packet:?}");
+            messenger.lock().unwrap().on_message(packet);
+            Box::pin(async {})
+        }));
+    }
 
     channel
 }

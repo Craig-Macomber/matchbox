@@ -11,18 +11,27 @@ use self::error::SignalingError;
 use crate::{Error, webrtc_socket::signal_peer::SignalPeer};
 use async_trait::async_trait;
 use cfg_if::cfg_if;
-use futures::{Future, FutureExt, StreamExt, future::Either, stream::FuturesUnordered};
-use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures::{
+    Future, FutureExt, StreamExt,
+    future::{Either, Fuse},
+    stream::FuturesUnordered,
+};
+use futures_channel::{
+    mpsc::{UnboundedReceiver, UnboundedSender},
+    oneshot::{self, Canceled},
+};
 use futures_timer::Delay;
 use futures_util::select;
 use log::{debug, error, warn};
 use matchbox_protocol::PeerId;
 pub use messages::*;
 pub(crate) use socket::MessageLoopChannels;
+use socket::SocketConfig;
 pub use socket::{
     ChannelConfig, PeerState, RtcIceServerConfig, WebRtcChannel, WebRtcSocket, WebRtcSocketBuilder,
 };
-use std::{collections::HashMap, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::HashMap, mem::take, pin::Pin, sync::Arc};
+use webrtc::turn::proto::channum::ChannelNumber;
 
 cfg_if! {
     if #[cfg(target_arch = "wasm32")] {
@@ -120,6 +129,8 @@ async fn signaling_loop(
             complete => break Ok(())
         }
     }
+
+    // TODO: should this `events_sender.close_channel();` to communicate disconnects?
 }
 
 /// The raw format of data being sent and received.
@@ -128,54 +139,92 @@ pub type Packet = Box<[u8]>;
 /// Errors that can happen when sending packets
 #[derive(Debug, thiserror::Error)]
 #[error("The socket was dropped and package could not be sent")]
-struct PacketSendError {
+pub struct PacketSendError {
     #[cfg(not(target_arch = "wasm32"))]
     source: futures_channel::mpsc::SendError,
     #[cfg(target_arch = "wasm32")]
     source: error::JsError,
 }
 
-trait PeerDataSender {
+pub(crate) trait PeerDataSender {
     fn send(&mut self, packet: Packet) -> Result<(), PacketSendError>;
 }
 
-struct HandshakeResult<D: PeerDataSender, M> {
+struct HandshakeResult<M> {
     peer_id: PeerId,
-    data_channels: Vec<D>,
     metadata: M,
 }
 
+/// A platform independent abstraction for the subset of Web Rtc APIs needed by matchbox_socket.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-trait Messenger {
-    type DataChannel: PeerDataSender;
+trait Messenger<Tx: DataChannelEventReceiver> {
+    type DataChannel: PeerDataSender; // TODO: MatchboxDataChannel
     type HandshakeMeta: Send;
 
     async fn offer_handshake(
         signal_peer: SignalPeer,
         mut peer_signal_rx: UnboundedReceiver<PeerSignal>,
-        messages_from_peers_tx: Vec<UnboundedSender<(PeerId, Packet)>>,
+        builders: Vec<ChannelBuilder<Tx>>,
         ice_server_config: &RtcIceServerConfig,
-        channel_configs: &[ChannelConfig],
-    ) -> HandshakeResult<Self::DataChannel, Self::HandshakeMeta>;
+        data_channels_ready_fut: Pin<
+            Box<Fuse<impl Future<Output = Result<(), Canceled>> + std::marker::Send>>,
+        >,
+    ) -> HandshakeResult<Self::HandshakeMeta>;
 
     async fn accept_handshake(
         signal_peer: SignalPeer,
         peer_signal_rx: UnboundedReceiver<PeerSignal>,
-        messages_from_peers_tx: Vec<UnboundedSender<(PeerId, Packet)>>,
+        builders: Vec<ChannelBuilder<Tx>>,
         ice_server_config: &RtcIceServerConfig,
-        channel_configs: &[ChannelConfig],
-    ) -> HandshakeResult<Self::DataChannel, Self::HandshakeMeta>;
-
-    async fn peer_loop(peer_uuid: PeerId, handshake_meta: Self::HandshakeMeta) -> PeerId;
+        data_channels_ready_fut: Pin<
+            Box<Fuse<impl Future<Output = Result<(), Canceled>> + std::marker::Send>>,
+        >,
+    ) -> HandshakeResult<Self::HandshakeMeta>;
 }
 
-async fn message_loop<M: Messenger>(
+struct ChannelBuilder<Tx: DataChannelEventReceiver> {
+    /// Where to send all incoming events triggered by the channel.
+    event_handlers: Tx,
+    /// Configuration for the channel to build.
+    channel_config: ChannelConfig,
+}
+
+/// Receiver for events from a [MatchboxDataChannel].
+///
+/// Receives events from a [RTCDataChannel](https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel).
+trait DataChannelEventReceiver: Send + Sync + 'static {
+    fn on_open(&mut self);
+    fn on_close(&mut self);
+    fn on_error(&mut self, message: String);
+    fn on_message(&mut self, packet: Packet);
+    /// [bufferedamountlow event](https://developer.mozilla.org/en-US/docs/Web/API/RTCDataChannel/bufferedamountlow_event).
+    fn on_buffered_amount_low(&mut self);
+}
+
+/// Message from a specific Peer.
+/// Aggregates messages from all channels to that Peer.
+enum PeerMessage {
+    /// The Peer has connected, and finished opening all requested channels.
+    Join,
+
+    /// A packet has arrived on a channel between the Join and Close.
+    /// Packets from during the Join are buffered until after the Join.
+    /// Packets from after the Close are discarded.
+    Packet(ChannelNumber, Packet),
+
+    /// Connection to this peer is no longer available.
+    ///
+    /// Triggered by the first channel to close or error after a `Join`.
+    /// If a string is provided, it is the error message. If none is provided, an orderly close
+    /// occured (for at least the first channel to close or error).
+    Close(Option<String>),
+}
+
+async fn message_loop<M: Messenger<AsyncDataChannelReceiver>>(
     id_tx: futures_channel::oneshot::Sender<PeerId>,
-    ice_server_config: &RtcIceServerConfig,
-    channel_configs: &[ChannelConfig],
+    config: SocketConfig,
     channels: MessageLoopChannels,
-    keep_alive_interval: Option<Duration>,
 ) -> Result<(), SignalingError> {
     let MessageLoopChannels {
         requests_sender,
@@ -185,35 +234,57 @@ async fn message_loop<M: Messenger>(
         peer_state_tx,
     } = channels;
 
-    let mut handshakes = FuturesUnordered::new();
-    let mut peer_loops = FuturesUnordered::new();
-    let mut handshake_signals = HashMap::new();
-    let mut data_channels = HashMap::new();
+    // TODO: Remove need to forward from messages_from_peers to messages_from_peers_tx
+    let (messages_from_peers_tx_2, mut messages_from_peers) =
+        futures_channel::mpsc::unbounded::<(PeerId, PeerMessage)>();
+
+    let handshakes = FuturesUnordered::new();
+    let mut handshake_signals: HashMap<PeerId, futures_channel::mpsc::UnboundedSender<PeerSignal>> =
+        HashMap::new();
+
+    // TODO: might need to send errors when join fails.
+    let mut ready_signals: HashMap<PeerId, oneshot::Sender<()>> = HashMap::new();
+
     let mut id_tx = Option::Some(id_tx);
 
-    let mut timeout = if let Some(interval) = keep_alive_interval {
+    let mut timeout = if let Some(interval) = config.keep_alive_interval {
         Either::Left(Delay::new(interval))
     } else {
         Either::Right(std::future::pending())
     }
     .fuse();
 
+    let setup_peer =
+        |sender: PeerId,
+         handshake_signals: &mut HashMap<PeerId, _>,
+         ready_signals: &mut HashMap<PeerId, oneshot::Sender<()>>| {
+            let (signal_tx, signal_rx) = futures_channel::mpsc::unbounded();
+            let (ready_sender, ready_receiver) = oneshot::channel();
+            handshake_signals.insert(sender, signal_tx.clone());
+            ready_signals.insert(sender, ready_sender);
+            let signal_peer = SignalPeer::new(sender, requests_sender.clone());
+            let builders = AsyncDataChannelReceiver::channels_for_peer(
+                sender,
+                &config.channels,
+                messages_from_peers_tx_2.clone(),
+            );
+            (
+                signal_peer,
+                signal_rx,
+                builders,
+                Box::pin(ready_receiver.fuse()),
+                signal_tx,
+            )
+        };
+
     loop {
-        let mut next_peer_messages_out = peer_messages_out_rx
-            .iter_mut()
-            .enumerate()
-            .map(|(channel, rx)| async move { (channel, rx.next().await) })
-            .collect::<FuturesUnordered<_>>();
-
-        let mut next_peer_message_out = next_peer_messages_out.next().fuse();
-
         select! {
             _  = &mut timeout => {
                 if requests_sender.unbounded_send(PeerRequest::KeepAlive).is_err() {
                     // socket dropped
                     break Ok(());
                 }
-                if let Some(interval) = keep_alive_interval {
+                if let Some(interval) = config.keep_alive_interval {
                     timeout = Either::Left(Delay::new(interval)).fuse();
                 } else {
                     error!("no keep alive timeout, please file a bug");
@@ -230,23 +301,18 @@ async fn message_loop<M: Messenger>(
                                 break Ok(());
                             };
                         },
-                        PeerEvent::NewPeer(peer_uuid) => {
-                            let (signal_tx, signal_rx) = futures_channel::mpsc::unbounded();
-                            handshake_signals.insert(peer_uuid, signal_tx);
-                            let signal_peer = SignalPeer::new(peer_uuid, requests_sender.clone());
-                            handshakes.push(M::offer_handshake(signal_peer, signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs))
+                        PeerEvent::NewPeer(sender) => {
+                            let (signal_peer, signal_rx, builders, ready_receiver, _from_peer_tx) = setup_peer(sender, &mut handshake_signals, &mut ready_signals);
+                            handshakes.push(M::offer_handshake(signal_peer, signal_rx, builders, &config.ice_server, ready_receiver))
                         },
                         PeerEvent::PeerLeft(peer_uuid) => {
-                            if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected)).is_err() {
-                                // socket dropped, exit cleanly
-                                break Ok(());
-                            }
+                            // TODO: Better cleanup
+                            handshake_signals.remove(&peer_uuid);
                         },
                         PeerEvent::Signal { sender, data } => {
+                            let (signal_peer, signal_rx, builders, ready_receiver, from_peer_tx) = setup_peer(sender, &mut handshake_signals, &mut ready_signals);
                             let signal_tx = handshake_signals.entry(sender).or_insert_with(|| {
-                                let (from_peer_tx, peer_signal_rx) = futures_channel::mpsc::unbounded();
-                                let signal_peer = SignalPeer::new(sender, requests_sender.clone());
-                                handshakes.push(M::accept_handshake(signal_peer, peer_signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs));
+                                handshakes.push(M::accept_handshake(signal_peer, signal_rx, builders, &config.ice_server, ready_receiver), );
                                 from_peer_tx
                             });
 
@@ -258,38 +324,19 @@ async fn message_loop<M: Messenger>(
                 }
             }
 
-            handshake_result = handshakes.select_next_some() => {
-                data_channels.insert(handshake_result.peer_id, handshake_result.data_channels);
-                if peer_state_tx.unbounded_send((handshake_result.peer_id, PeerState::Connected)).is_err() {
-                    // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore
-                    break Ok(());
-                }
-                peer_loops.push(M::peer_loop(handshake_result.peer_id, handshake_result.metadata));
-            }
-
-            peer_uuid = peer_loops.select_next_some() => {
-                debug!("peer {peer_uuid} finished");
-                if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected)).is_err() {
-                    // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore
-                    break Ok(());
-                }
-            }
-
-            message = next_peer_message_out => {
+            message = messages_from_peers.next().fuse() => {
                 match message {
-                    Some((channel_index, Some((peer, packet)))) => {
-                        let data_channel = data_channels
-                            .get_mut(&peer)
-                            .expect("couldn't find data channel for peer")
-                            .get_mut(channel_index).unwrap_or_else(|| panic!("couldn't find data channel with index {channel_index}"));
-                        if let Err(e) = data_channel.send(packet) {
-                            // Peer we're sending to closed their end of the connection.
-                            // We anticipate the PeerLeft event soon, but we sent a message before it came.
-                            // Do nothing. Only log it.
-                            warn!("failed to send to peer {peer} (socket closed): {e:?}");
-                        };
-                    }
-                    Some((_, None)) | None => {
+                    Some((peer,PeerMessage::Join))=>{
+                            ready_signals.remove(&peer).unwrap().send(());
+                            peer_state_tx.unbounded_send((peer, PeerState::Connected));
+                        }
+                        Some((peer,PeerMessage::Packet(channel, packet)))=>{
+                            messages_from_peers_tx[channel.0 as usize].unbounded_send((peer, packet));
+                        }
+                        Some((peer,PeerMessage::Close(error)))=>{
+                            peer_state_tx.unbounded_send((peer, PeerState::Disconnected));
+                        }
+                    None => {
                         // Receiver end of outgoing message channel closed,
                         // which most likely means the socket was dropped.
                         // There could probably be cleaner ways to handle this,
@@ -302,5 +349,140 @@ async fn message_loop<M: Messenger>(
 
             complete => break Ok(())
         }
+    }
+}
+
+pub struct AsyncDataChannelReceiver {
+    /// Shared reference to the UnboundedPeerReceiver for this peer.
+    /// All channels for the peer share this reference, and use it to coordinate.
+    peer: Arc<std::sync::Mutex<UnboundedPeerReceiver>>,
+    /// Which channel this is for.
+    channel: ChannelNumber,
+}
+
+/// Forwards messages from all channels for a given peer
+pub struct UnboundedPeerReceiver {
+    remote_id: PeerId,
+    /// Starts a number of channels and counts down as they connect.
+    /// Connection event occurs when this hits zero meaning all channels are connected.
+    connecting_count: usize,
+    closed: bool,
+
+    /// Buffer of packets which name in before connecting_count reached 0.
+    buffer: Option<Vec<(ChannelNumber, Packet)>>,
+
+    messages_from_peers_tx: UnboundedSender<(PeerId, PeerMessage)>,
+}
+
+impl UnboundedPeerReceiver {
+    fn channel_open(&mut self) {
+        if self.closed {
+            return;
+        }
+
+        // Decrement number of connecting_count
+        self.connecting_count -= 1;
+
+        if self.connecting_count == 0 {
+            // If this is the last channel to connect based on connecting_count, send Join message.
+            self.forward(PeerMessage::Join);
+
+            // Flush buffer
+            let buffer = take(&mut self.buffer).unwrap();
+            for b in buffer.into_iter() {
+                self.forward(PeerMessage::Packet(b.0, b.1));
+            }
+        }
+    }
+
+    fn channel_close(&mut self, error: Option<String>) {
+        if self.closed {
+            return;
+        }
+        // If joined was sent, send close event.
+        if self.connecting_count == 0 {
+            self.forward(PeerMessage::Close(error));
+        }
+        self.closed = true;
+        // Avoid holding onto unneeded memory.
+        self.buffer = None;
+    }
+
+    fn forward(&self, msg: PeerMessage) {
+        assert!(!self.closed);
+        self.messages_from_peers_tx
+            .unbounded_send((self.remote_id, msg))
+            .unwrap();
+    }
+
+    fn channel_packet(&mut self, channel: ChannelNumber, msg: Packet) {
+        if let Some(buffer) = &mut self.buffer {
+            buffer.push((channel, msg))
+        } else {
+            if !self.closed {
+                self.forward(PeerMessage::Packet(channel, msg));
+            }
+        }
+    }
+}
+
+impl AsyncDataChannelReceiver {
+    pub fn channels_for_peer(
+        remote_id: PeerId,
+        config: &[ChannelConfig],
+        messages_from_peers_tx: UnboundedSender<(PeerId, PeerMessage)>,
+    ) -> Vec<ChannelBuilder<AsyncDataChannelReceiver>> {
+        assert!(config.len() > 0);
+
+        let peer = UnboundedPeerReceiver {
+            remote_id,
+            connecting_count: config.len(),
+            closed: false,
+            buffer: Some(vec![]),
+            messages_from_peers_tx,
+        };
+
+        let peer: Arc<std::sync::Mutex<UnboundedPeerReceiver>> = Arc::new(peer.into());
+
+        config
+            .iter()
+            .enumerate()
+            .map(|(channel, channel_config)| ChannelBuilder {
+                channel_config: channel_config.clone(),
+
+                event_handlers: AsyncDataChannelReceiver {
+                    // Number channel based off of index.
+                    // Assumes number of channels fits in a u16.
+                    channel: ChannelNumber(channel.try_into().unwrap()),
+                    peer: peer.clone(),
+                },
+            })
+            .collect()
+    }
+}
+
+impl DataChannelEventReceiver for AsyncDataChannelReceiver {
+    fn on_open(&mut self) {
+        self.peer.lock().unwrap().channel_open();
+    }
+
+    fn on_close(&mut self) {
+        self.peer.lock().unwrap().channel_close(None);
+    }
+
+    fn on_error(&mut self, message: String) {
+        warn!("data channel error {message}");
+        self.peer.lock().unwrap().channel_close(Some(message));
+    }
+
+    fn on_message(&mut self, packet: Packet) {
+        self.peer
+            .lock()
+            .unwrap()
+            .channel_packet(self.channel, packet);
+    }
+
+    fn on_buffered_amount_low(&mut self) {
+        todo!()
     }
 }
