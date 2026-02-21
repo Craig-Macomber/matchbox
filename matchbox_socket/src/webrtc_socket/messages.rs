@@ -19,19 +19,18 @@ pub type PeerRequest = matchbox_protocol::PeerRequest<PeerSignal>;
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
 pub enum PeerSignal {
     /// [Ice (Interactive Connectivity Establishment) Candidate](https://en.wikipedia.org/wiki/Interactive_Connectivity_Establishment).
-    ///
-    /// JSON encoding of an [`RTCIceCandidate`](https://developer.mozilla.org/en-US/docs/Web/API/RTCIceCandidate).
-    ///
-    /// Note that while [`RTCIceCandidate`](https://developer.mozilla.org/en-US/docs/Web/API/RTCIceCandidate/RTCIceCandidate)'s
-    /// constructor accepts a string for legacy purposes, that is not how this is being used: this
-    /// is instead a
-    /// [JSON encoding of the of the `RTCIceCandidate``](https://developer.mozilla.org/en-US/docs/Web/API/RTCIceCandidate/toJSON).
-    ///
-    /// When PeerSignal itself is JSON serialized, that results in JSON data as a string inside of
-    /// another JSON string: this is inefficient. Storing this as a string here also reduces type
-    /// safety and clarity at this layer. It may be preferable to instead include the structured
-    /// data here as more specific Rust types, but this would be a breaking protocol change, and
-    /// would only offer small benefits.
+    // JSON encoding of an [`RTCIceCandidate`](https://developer.mozilla.org/en-US/docs/Web/API/RTCIceCandidate).
+    //
+    // Note that while [`RTCIceCandidate`](https://developer.mozilla.org/en-US/docs/Web/API/RTCIceCandidate/RTCIceCandidate)'s
+    // constructor accepts a string for legacy purposes, that is not how this is being used: this
+    // is instead a
+    // [JSON encoding of the of the `RTCIceCandidate`](https://developer.mozilla.org/en-US/docs/Web/API/RTCIceCandidate/toJSON).
+    //
+    // When PeerSignal itself is JSON serialized, that results in JSON data as a string inside of
+    // another JSON string: this is inefficient (but negligibly so) and reduces type safety.
+    // It may be preferable refactor the abstraction implemented by the native and wasm sockets to
+    // have a with a more specific type instead of this to deduplicate their encoding logic
+    // and help ensure they are well aligned and can interoperate.
     IceCandidate(String),
     /// Offer a handshake.
     ///
