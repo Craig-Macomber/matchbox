@@ -9,19 +9,12 @@ use crate::{
         message_loop, signaling_loop,
     },
 };
-use bytes::Bytes;
-use futures::{
-    AsyncRead, AsyncWrite, Future, FutureExt, Sink, SinkExt, Stream, StreamExt, TryStreamExt,
-    future::Fuse, select,
-};
+
+use futures::{Future, FutureExt, Sink, Stream, StreamExt, future::Fuse, select};
 use futures_channel::mpsc::{SendError, TrySendError, UnboundedReceiver, UnboundedSender};
 use log::{debug, error};
 use matchbox_protocol::PeerId;
-use std::{collections::HashMap, future::ready, pin::Pin, sync::Arc, task::Poll, time::Duration};
-use tokio_util::{
-    compat::TokioAsyncWriteCompatExt,
-    io::{CopyToBytes, SinkWriter},
-};
+use std::{collections::HashMap, pin::Pin, sync::Arc, task::Poll, time::Duration};
 
 /// Configuration options for an ICE server connection.
 /// See also: <https://developer.mozilla.org/en-US/docs/Web/API/RTCIceServer#example>
@@ -279,6 +272,8 @@ pub enum PeerState {
 }
 /// Used to send and receive packets on a given WebRTC channel. Must be created as part of a
 /// [`WebRtcSocket`].
+/// This corresponds to a collection of lower level channels, one for each [`PeerState::Connected`]
+/// peer (identified by their PeerId).
 #[derive(Debug)]
 pub struct WebRtcChannel {
     config: ChannelConfig,
@@ -397,74 +392,6 @@ impl Sink<(PeerId, Packet)> for WebRtcChannel {
     }
 }
 
-/// A channel which supports reading and writing raw bytes.
-pub struct RawPeerChannel<R, W> {
-    id: Option<PeerId>,
-    remote: PeerId,
-    reader: R,
-    writer: W,
-}
-
-impl<R, W> RawPeerChannel<R, W> {
-    /// Returns the id of this peer.
-    ///
-    /// Also see [`WebRtcSocket::id`].
-    pub fn id(&self) -> Option<PeerId> {
-        self.id
-    }
-
-    /// Returns the id of the remote peer to which this channel is connected.
-    pub fn remote(&self) -> PeerId {
-        self.remote
-    }
-}
-
-impl<R, W> AsyncRead for RawPeerChannel<R, W>
-where
-    Self: Unpin,
-    R: AsyncRead + Unpin,
-{
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let mut reader = Pin::new(&mut self.get_mut().reader);
-        reader.as_mut().poll_read(cx, buf)
-    }
-}
-
-impl<R, W> AsyncWrite for RawPeerChannel<R, W>
-where
-    Self: Unpin,
-    W: AsyncWrite + Unpin,
-{
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let mut writer = Pin::new(&mut self.get_mut().writer);
-        writer.as_mut().poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let mut writer = Pin::new(&mut self.get_mut().writer);
-        writer.as_mut().poll_flush(cx)
-    }
-
-    fn poll_close(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let mut writer = Pin::new(&mut self.get_mut().writer);
-        writer.as_mut().poll_close(cx)
-    }
-}
-
 /// Contains a set of [`WebRtcChannel`]s and connection metadata.
 #[derive(Debug)]
 pub struct WebRtcSocket {
@@ -472,6 +399,9 @@ pub struct WebRtcSocket {
     id_rx: futures_channel::oneshot::Receiver<PeerId>,
     peer_state_rx: futures_channel::mpsc::UnboundedReceiver<(PeerId, PeerState)>,
     peers: HashMap<PeerId, PeerState>,
+    /// The channels, in the order specified by the builder.
+    /// These are [`Some`] even before any connection is made: the only transition to [`None`] when
+    /// [`ChannelError::Taken`].
     channels: Vec<Option<WebRtcChannel>>,
 }
 
@@ -643,7 +573,8 @@ impl WebRtcSocket {
         self.get_channel(channel).unwrap()
     }
 
-    /// Gets a mutable reference to the [`WebRtcChannel`] of a given id.
+    /// Gets a mutable reference to the [`WebRtcChannel`] at the specified index.
+    /// The channels are indexed based on the order they were added to the builder.
     ///
     /// ```
     /// use matchbox_socket::*;
@@ -661,11 +592,12 @@ impl WebRtcSocket {
     /// # Panics
     ///
     /// will panic if the channel cannot be found.
-    pub fn channel_mut(&mut self, channel: usize) -> &mut WebRtcChannel {
-        self.get_channel_mut(channel).unwrap()
+    pub fn channel_mut(&mut self, channel_index: usize) -> &mut WebRtcChannel {
+        self.get_channel_mut(channel_index).unwrap()
     }
 
-    /// Gets an immutable reference to the [`WebRtcChannel`] of a given id.
+    /// Gets an immutable reference to the [`WebRtcChannel`] at the specified index.
+    /// The channels are indexed based on the order they were added to the builder.
     ///
     /// Returns an error if the channel was not found.
     ///
@@ -680,15 +612,16 @@ impl WebRtcSocket {
     /// ```
     ///
     /// See also: [`WebRtcSocket::get_channel_mut`], [`WebRtcSocket::take_channel`]
-    pub fn get_channel(&self, channel: usize) -> Result<&WebRtcChannel, ChannelError> {
+    pub fn get_channel(&self, channel_index: usize) -> Result<&WebRtcChannel, ChannelError> {
         self.channels
-            .get(channel)
+            .get(channel_index)
             .ok_or(ChannelError::NotFound)?
             .as_ref()
             .ok_or(ChannelError::Taken)
     }
 
-    /// Gets a mutable reference to the [`WebRtcChannel`] of a given id.
+    /// Gets a mutable reference to the [`WebRtcChannel`] at the specified index.
+    /// The channels are indexed based on the order they were added to the builder.
     ///
     /// Returns an error if the channel was not found.
     ///
@@ -703,15 +636,19 @@ impl WebRtcSocket {
     /// ```
     ///
     /// See also: [`WebRtcSocket::channel`], [`WebRtcSocket::take_channel`]
-    pub fn get_channel_mut(&mut self, channel: usize) -> Result<&mut WebRtcChannel, ChannelError> {
+    pub fn get_channel_mut(
+        &mut self,
+        channel_index: usize,
+    ) -> Result<&mut WebRtcChannel, ChannelError> {
         self.channels
-            .get_mut(channel)
+            .get_mut(channel_index)
             .ok_or(ChannelError::NotFound)?
             .as_mut()
             .ok_or(ChannelError::Taken)
     }
 
-    /// Takes the [`WebRtcChannel`] of a given id.
+    /// Takes the [`WebRtcChannel`] at the specified index.
+    /// The channels are indexed based on the order they were added to the builder.
     ///
     /// ```
     /// use matchbox_socket::*;
@@ -725,58 +662,22 @@ impl WebRtcSocket {
     /// ```
     ///
     /// See also: [`WebRtcSocket::channel`]
-    pub fn take_channel(&mut self, channel: usize) -> Result<WebRtcChannel, ChannelError> {
+    pub fn take_channel(&mut self, channel_index: usize) -> Result<WebRtcChannel, ChannelError> {
         self.channels
-            .get_mut(channel)
+            .get_mut(channel_index)
             .ok_or(ChannelError::NotFound)?
             .take()
             .ok_or(ChannelError::Taken)
     }
 
-    /// Takes the [`WebRtcChannel`] of a given [`PeerId`].
-    pub fn take_channel_by_id(&mut self, id: PeerId) -> Result<WebRtcChannel, ChannelError> {
-        let pos = self
-            .connected_peers()
-            .position(|peer_id| peer_id == id)
-            .ok_or(ChannelError::NotFound)?;
-
-        self.take_channel(pos)
-    }
-
-    /// Converts the [`WebRtcChannel`] of a given [`PeerId`] into a [`RawPeerChannel`].
-    pub fn take_raw_by_id(
-        &mut self,
-        remote: PeerId,
-    ) -> Result<RawPeerChannel<impl AsyncRead + use<>, impl AsyncWrite + use<>>, ChannelError> {
-        let channel = self.take_channel_by_id(remote)?;
-        let id = self.id();
-
-        let (reader, writer) = compat_read_write(remote, channel.rx, channel.tx);
-
-        let peer_channel = RawPeerChannel {
-            id,
-            remote,
-            reader,
-            writer,
-        };
-
-        Ok(peer_channel)
-    }
-
-    /// Returns whether any socket channel is closed
+    /// Returns whether any (non-taken) socket channel is closed.
     pub fn any_channel_closed(&self) -> bool {
-        self.channels
-            .iter()
-            .filter_map(Option::as_ref)
-            .any(|c| c.is_closed())
+        self.channels.iter().flatten().any(|c| c.is_closed())
     }
 
-    /// Returns whether all socket channels are closed
+    /// Returns whether all (non-taken) socket channels are closed.
     pub fn all_channels_closed(&self) -> bool {
-        self.channels
-            .iter()
-            .filter_map(Option::as_ref)
-            .all(|c| c.is_closed())
+        self.channels.iter().flatten().all(|c| c.is_closed())
     }
 }
 
@@ -878,29 +779,9 @@ async fn run_socket(
     }
 }
 
-fn compat_read_write(
-    remote: PeerId,
-    stream: UnboundedReceiver<(PeerId, Packet)>,
-    sink: UnboundedSender<(PeerId, Packet)>,
-) -> (impl AsyncRead, impl AsyncWrite) {
-    let reader = stream
-        .then(|(_, packet)| ready(Ok::<_, std::io::Error>(packet)))
-        .into_async_read();
-
-    let writer = sink
-        .with(move |packet: Bytes| ready(Ok::<_, SendError>((remote, Box::from(packet.as_ref())))));
-
-    let writer = writer.sink_map_err(std::io::Error::other);
-    let writer = CopyToBytes::new(writer);
-    let writer = SinkWriter::new(writer);
-    let writer = TokioAsyncWriteCompatExt::compat_write(writer);
-
-    (reader, writer)
-}
-
 #[cfg(test)]
 mod test {
-    use crate::{ChannelConfig, Error, WebRtcSocketBuilder};
+    use crate::{ChannelConfig, ChannelError, Error, WebRtcSocket, WebRtcSocketBuilder};
 
     #[futures_test::test]
     async fn unreachable_server() {
@@ -930,5 +811,73 @@ mod test {
             result.unwrap_err(),
             Error::ConnectionFailed { .. },
         ));
+    }
+
+    #[test]
+    #[should_panic(expected = "Must have added at least one channel")]
+    fn no_channels() {
+        let (_socket, _fut) = WebRtcSocketBuilder::new("wss://example.invalid").build();
+    }
+
+    #[test]
+    fn builder() {
+        let mut builder = WebRtcSocket::builder("wss://example.invalid");
+        builder = builder.add_reliable_channel();
+        builder = builder.add_unreliable_channel();
+        let (socket, _fut) = builder.build();
+        assert_eq!(socket.channels.len(), 2);
+        // Channels are populated immediately, even before connecting.
+        let config_0 = &socket.channels[0].as_ref().unwrap().config;
+        let config_1 = &socket.channels[1].as_ref().unwrap().config;
+        assert!(config_0.ordered);
+        assert_eq!(config_0.max_retransmits, None);
+        assert!(!config_1.ordered);
+        assert_eq!(config_1.max_retransmits, Some(0));
+    }
+
+    #[test]
+    fn take_channel() {
+        let mut builder = WebRtcSocket::builder("wss://example.invalid");
+        builder = builder.add_reliable_channel();
+        let (mut socket, _fut) = builder.build();
+        assert!(socket.channels[0].is_some());
+
+        assert!(!socket.any_channel_closed());
+        assert!(!socket.all_channels_closed());
+
+        let mut taken = socket.take_channel(0).unwrap();
+
+        assert!(!socket.any_channel_closed());
+        assert!(socket.all_channels_closed());
+
+        assert!(socket.channels[0].is_none());
+        assert!(matches!(
+            socket.take_channel(0).unwrap_err(),
+            ChannelError::Taken,
+        ));
+        assert!(!taken.is_closed());
+        taken.close();
+        assert!(taken.is_closed());
+    }
+
+    #[test]
+    fn closed_channels() {
+        let mut builder = WebRtcSocket::builder("wss://example.invalid");
+        builder = builder.add_reliable_channel();
+        builder = builder.add_reliable_channel();
+        let (mut socket, _fut) = builder.build();
+
+        assert!(!socket.any_channel_closed());
+        assert!(!socket.all_channels_closed());
+
+        socket.get_channel_mut(0).unwrap().close();
+
+        assert!(socket.any_channel_closed());
+        assert!(!socket.all_channels_closed());
+
+        socket.get_channel_mut(1).unwrap().close();
+
+        assert!(socket.any_channel_closed());
+        assert!(socket.all_channels_closed());
     }
 }
